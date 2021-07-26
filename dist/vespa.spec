@@ -357,7 +357,7 @@ Requires: vespa-openssl >= 1.1.1k-1
 %if 0%{?amzn2}
 Requires: vespa-protobuf = 3.7.0-5.amzn2
 %else
-Requires: vespa-protobuf = 3.17.3-3.el7
+Requires: vespa-protobuf = 3.17.3-2.el7
 Requires: vespa-brpc = 0.9.7-4.el7
 %endif
 %else
