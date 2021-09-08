@@ -88,7 +88,7 @@ BuildRequires: vespa-openssl-devel >= 1.1.1k-1
 BuildRequires: vespa-protobuf-devel = 3.7.0-5.amzn2
 %else
 BuildRequires: vespa-protobuf-devel = 3.17.3-2.el7
-BuildRequires: vespa-brpc-devel >= 0.9.7-7.el7
+BuildRequires: vespa-brpc-devel >= 0.9.7-9.el7
 %endif
 %else
 BuildRequires: vespa-protobuf-devel = 3.7.0-5.el7
@@ -275,9 +275,9 @@ Requires: %{name}-tools = %{version}-%{release}
 # Ugly workaround because vespamalloc/src/vespamalloc/malloc/mmap.cpp uses the private
 # _dl_sym function. Exclude automated reqires for libraries in /opt/vespa-deps/lib64.
 %if 0%{?amzn2}
-%global __requires_exclude ^lib(c\\.so\\.6\\(GLIBC_PRIVATE\\)|pthread\\.so\\.0\\(GLIBC_PRIVATE\\)|(brpc|crypto|icui18n|icuuc|lz4|protobuf|ssl|zstd|onnxruntime|openblas|re2|xxhash)\\.so\\.[0-9.]*\\([A-Z._0-9]*\\))\\(64bit\\)$
+%global __requires_exclude ^lib(c\\.so\\.6\\(GLIBC_PRIVATE\\)|pthread\\.so\\.0\\(GLIBC_PRIVATE\\)|(crypto|icui18n|icuuc|lz4|protobuf|ssl|zstd|onnxruntime|openblas|re2|xxhash)\\.so\\.[0-9.]*\\([A-Z._0-9]*\\))\\(64bit\\)$
 %else
-%global __requires_exclude ^lib(c\\.so\\.6\\(GLIBC_PRIVATE\\)|pthread\\.so\\.0\\(GLIBC_PRIVATE\\)|(brpc|crypto|icui18n|icuuc|lz4|protobuf|ssl|zstd|onnxruntime)\\.so\\.[0-9.]*\\([A-Z._0-9]*\\))\\(64bit\\)$
+%global __requires_exclude ^lib(c\\.so\\.6\\(GLIBC_PRIVATE\\)|pthread\\.so\\.0\\(GLIBC_PRIVATE\\)|(crypto|icui18n|icuuc|lz4|protobuf|ssl|zstd|onnxruntime)\\.so\\.[0-9.]*\\([A-Z._0-9]*\\))\\(64bit\\)$
 %endif
 
 
@@ -358,7 +358,7 @@ Requires: vespa-openssl >= 1.1.1k-1
 Requires: vespa-protobuf = 3.7.0-5.amzn2
 %else
 Requires: vespa-protobuf = 3.17.3-2.el7
-Requires: vespa-brpc = 0.9.7-7.el7
+Requires: vespa-brpc = 0.9.7-9.el7
 %endif
 %else
 Requires: vespa-protobuf = 3.7.0-5.el7
