@@ -87,8 +87,8 @@ BuildRequires: vespa-openssl-devel >= 1.1.1k-1
 %if 0%{?amzn2}
 BuildRequires: vespa-protobuf-devel = 3.7.0-5.amzn2
 %else
-BuildRequires: vespa-protobuf-devel = 3.17.3-2.el7
-BuildRequires: vespa-brpc-devel >= 0.9.7-11.el7
+BuildRequires: vespa-protobuf-devel = 3.18.0-1.el7
+BuildRequires: vespa-brpc-devel >= 0.9.7-12.el7
 %endif
 %else
 BuildRequires: vespa-protobuf-devel = 3.7.0-5.el7
@@ -357,8 +357,8 @@ Requires: vespa-openssl >= 1.1.1k-1
 %if 0%{?amzn2}
 Requires: vespa-protobuf = 3.7.0-5.amzn2
 %else
-Requires: vespa-protobuf = 3.17.3-2.el7
-Requires: vespa-brpc = 0.9.7-11.el7
+Requires: vespa-protobuf >= 3.18.0-1.el7
+Requires: vespa-brpc >= 0.9.7-12.el7
 %endif
 %else
 Requires: vespa-protobuf = 3.7.0-5.el7
