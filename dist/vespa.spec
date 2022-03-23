@@ -412,7 +412,6 @@ Requires: %{name}-base-libs = %{version}-%{release}
 Requires: llvm7.0-libs
 Requires: vespa-icu >= 65.1.0-1
 Requires: vespa-protobuf = 3.19.1
-Requires: vespa-brpc = 1.0.0-2
 %else
 Requires: libicu
 %endif
@@ -453,6 +452,7 @@ Requires: llvm-libs >= 13.0.1
 %endif
 %endif
 Requires: vespa-onnxruntime = 1.7.1
+Requires: vespa-brpc = 1.0.0
 
 %description libs
 
