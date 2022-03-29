@@ -114,7 +114,7 @@ BuildRequires: vespa-openssl-devel >= 1.1.1l-1
 %define _use_vespa_openssl 1
 BuildRequires: vespa-protobuf-devel = 3.19.1
 BuildRequires: vespa-libzstd-devel >= 1.4.5-2
-BuildRequires: vespa-brpc-devel >= 1.0.0-2
+BuildRequires: vespa-brpc-devel >= 1.0.0-3
 %endif
 %if 0%{?el8}
 BuildRequires: cmake >= 3.11.4-3
