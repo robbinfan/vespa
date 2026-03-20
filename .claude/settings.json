@@ -1,0 +1,20 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hook": "FILE=\"$CLAUDE_FILE_PATH\"; if echo \"$FILE\" | grep -qE '(parent/pom\\.xml|screwdriver\\.yaml)$'; then echo 'BLOCKED: Cannot modify parent/pom.xml or screwdriver.yaml without explicit approval' && exit 2; fi"
+      },
+      {
+        "matcher": "Bash",
+        "hook": "CMD=\"$CLAUDE_BASH_COMMAND\"; if echo \"$CMD\" | grep -qE '^mvn\\s' && ! echo \"$CMD\" | grep -qE '\\-pl\\s'; then echo 'BLOCKED: Root-level mvn build without -pl flag. Use: mvn <goal> -pl <module>' && exit 2; fi"
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hook": "echo \"[trace] Bash command completed with exit code $CLAUDE_EXIT_CODE\""
+      }
+    ]
+  }
+}
