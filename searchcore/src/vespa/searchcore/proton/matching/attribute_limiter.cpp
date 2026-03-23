@@ -2,6 +2,7 @@
 
 #include "attribute_limiter.h"
 #include <vespa/searchlib/attribute/attribute_histogram.h>
+#include <limits>
 #include <vespa/vespalib/util/stringfmt.h>
 #include <vespa/searchlib/fef/matchdatalayout.h>
 #include <vespa/searchlib/query/tree/range.h>
@@ -24,7 +25,7 @@ AttributeLimiter::AttributeLimiter(Searchable &searchable_attributes,
                                    const string &diversity_attribute,
                                    double diversityCutoffFactor,
                                    DiversityCutoffStrategy diversityCutoffStrategy,
-                                   const search::attribute::AttributeHistogram *histogram)
+                                   std::shared_ptr<const search::attribute::AttributeHistogram> histogram)
     : _searchable_attributes(searchable_attributes),
       _requestContext(requestContext),
       _attribute_name(attribute_name),
@@ -36,7 +37,7 @@ AttributeLimiter::AttributeLimiter(Searchable &searchable_attributes,
       _estimatedHits(-1),
       _diversityCutoffFactor(diversityCutoffFactor),
       _diversityCutoffStrategy(diversityCutoffStrategy),
-      _histogram(histogram)
+      _histogram(std::move(histogram))
 {
 }
 
@@ -108,7 +109,7 @@ AttributeLimiter::create_search(size_t want_hits, size_t max_group_size, bool st
             // Dynamic k: 2x want_hits for safety margin.
             // At high hit_ratio this still cuts the candidate set dramatically
             // (e.g., hit_ratio=0.5, want_hits=20000, k=40000 vs full corpus of millions)
-            size_t k = want_hits * 2;
+            size_t k = (want_hits <= std::numeric_limits<size_t>::max() / 2) ? want_hits * 2 : std::numeric_limits<size_t>::max();
             int64_t threshold = _histogram->estimate_threshold_for_count(
                 static_cast<uint32_t>(k), ascending);
             if (ascending) {

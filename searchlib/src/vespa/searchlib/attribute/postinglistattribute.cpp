@@ -21,7 +21,8 @@ PostingListAttributeBase(AttributeVector &attr,
                    attr.getConfig()),
       _attr(attr),
       _dictionary(enumStore.get_dictionary()),
-      _histogram()
+      _histogram(),
+      _histogram_dirty(true)
 { }
 
 template <typename P>
@@ -31,6 +32,7 @@ template <typename P>
 void
 PostingListAttributeBase<P>::clearAllPostings()
 {
+    _histogram_dirty = true;
     _postingList.clearBuilder();
     _attr.incGeneration(); // Force freeze
     auto clearer = [this](EntryRef posting_idx)
@@ -108,6 +110,9 @@ void
 PostingListAttributeBase<P>::updatePostings(PostingMap &changePost,
                                             const vespalib::datastore::EntryComparator &cmp)
 {
+    if (!changePost.empty()) {
+        _histogram_dirty = true;
+    }
     for (auto& elem : changePost) {
         EnumIndex idx = elem.first.getEnumIdx();
         auto& change = elem.second;
@@ -308,13 +313,17 @@ rebuild_histogram()
     if constexpr (std::is_same_v<LoadedValueType, const char*>) {
         return; // Histogram not applicable for string attributes
     } else {
+        if (!this->_histogram_dirty) {
+            return; // No posting list changes since last rebuild
+        }
+        this->_histogram_dirty = false;
         if (!_dictionary.get_has_btree_dictionary()) {
             return;
         }
         auto frozen = _dictionary.get_posting_dictionary().getFrozenView();
         size_t dict_size = frozen.size();
         if (dict_size <= 1) {
-            this->_histogram.reset();
+            this->_histogram = std::shared_ptr<const attribute::AttributeHistogram>();
             return;
         }
 
@@ -339,15 +348,16 @@ rebuild_histogram()
         }
 
         if (min_val >= max_val) {
-            this->_histogram.reset();
+            this->_histogram = std::shared_ptr<const attribute::AttributeHistogram>();
             return;
         }
 
-        auto hist = std::make_unique<attribute::AttributeHistogram>();
+        auto hist = std::make_shared<attribute::AttributeHistogram>();
         hist->reset(min_val, max_val);
         for (auto& e : entries) {
             hist->add(e.val, e.count);
         }
+        // Atomic swap: readers holding the old shared_ptr stay safe
         this->_histogram = std::move(hist);
     }
 }

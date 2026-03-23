@@ -12,8 +12,8 @@ AttributeHistogram::AttributeHistogram()
 }
 
 AttributeHistogram::AttributeHistogram(uint32_t num_buckets)
-    : _buckets(num_buckets, 0),
-      _num_buckets(num_buckets),
+    : _buckets(std::max(num_buckets, 1u), 0),
+      _num_buckets(std::max(num_buckets, 1u)),
       _min_value(0),
       _max_value(0),
       _bucket_width(1.0),
@@ -30,7 +30,8 @@ AttributeHistogram::reset(int64_t min_value, int64_t max_value)
     _total_count = 0;
     std::fill(_buckets.begin(), _buckets.end(), 0);
     if (max_value > min_value) {
-        _bucket_width = static_cast<double>(max_value - min_value + 1) / _num_buckets;
+        // Use floating point to avoid int64_t overflow when max_value - min_value + 1 exceeds INT64_MAX
+        _bucket_width = (static_cast<double>(max_value) - static_cast<double>(min_value) + 1.0) / _num_buckets;
         _valid = true;
     } else if (max_value == min_value) {
         _bucket_width = 1.0;
@@ -45,7 +46,8 @@ AttributeHistogram::bucket_index(int64_t value) const
 {
     if (value <= _min_value) return 0;
     if (value >= _max_value) return _num_buckets - 1;
-    uint32_t idx = static_cast<uint32_t>((value - _min_value) / _bucket_width);
+    // Use double subtraction to avoid int64_t overflow/precision loss for large ranges
+    uint32_t idx = static_cast<uint32_t>((static_cast<double>(value) - static_cast<double>(_min_value)) / _bucket_width);
     if (idx >= _num_buckets) idx = _num_buckets - 1;
     return idx;
 }
@@ -88,13 +90,16 @@ AttributeHistogram::estimate(int64_t lo, int64_t hi) const
     uint32_t lo_bucket = bucket_index(lo);
     uint32_t hi_bucket = bucket_index(hi);
 
+    // Use double(hi) + 1.0 instead of hi + 1 to avoid int64_t overflow when hi == INT64_MAX
+    double hi_upper = static_cast<double>(hi) + 1.0;
+
     if (lo_bucket == hi_bucket) {
         // Query range falls within a single bucket — use fractional overlap
         double bkt_lo = _min_value + lo_bucket * _bucket_width;
         double bkt_hi = bkt_lo + _bucket_width;
-        double overlap = (std::min(bkt_hi, static_cast<double>(hi + 1)) -
+        double overlap = (std::min(bkt_hi, hi_upper) -
                          std::max(bkt_lo, static_cast<double>(lo))) / _bucket_width;
-        return static_cast<uint32_t>(overlap * _buckets[lo_bucket]);
+        return static_cast<uint32_t>(std::round(overlap * _buckets[lo_bucket]));
     }
 
     // Partial first bucket
@@ -114,11 +119,11 @@ AttributeHistogram::estimate(int64_t lo, int64_t hi) const
     {
         double bkt_lo = _min_value + hi_bucket * _bucket_width;
         double bkt_hi = bkt_lo + _bucket_width;
-        double frac = (std::min(bkt_hi, static_cast<double>(hi + 1)) - bkt_lo) / _bucket_width;
+        double frac = (std::min(bkt_hi, hi_upper) - bkt_lo) / _bucket_width;
         sum += frac * _buckets[hi_bucket];
     }
 
-    return static_cast<uint32_t>(sum);
+    return static_cast<uint32_t>(std::round(sum));
 }
 
 int64_t

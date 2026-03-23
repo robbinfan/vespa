@@ -51,7 +51,8 @@ protected:
     PostingList _postingList;
     AttributeVector &_attr;
     IEnumStoreDictionary& _dictionary;
-    std::unique_ptr<attribute::AttributeHistogram> _histogram;
+    std::shared_ptr<const attribute::AttributeHistogram> _histogram;
+    bool _histogram_dirty;
 
     PostingListAttributeBase(AttributeVector &attr, IEnumStore &enumStore);
     ~PostingListAttributeBase() override;
@@ -76,7 +77,7 @@ protected:
 public:
     const PostingList & getPostingList() const { return _postingList; }
     PostingList & getPostingList()             { return _postingList; }
-    const attribute::AttributeHistogram* get_histogram() const override { return _histogram.get(); }
+    std::shared_ptr<const attribute::AttributeHistogram> get_histogram() const override { return _histogram; }
 };
 
 template <typename P, typename LoadedVector, typename LoadedValueType,

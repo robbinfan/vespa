@@ -71,12 +71,12 @@ LimitedSearch::visitMembers(vespalib::ObjectVisitor &visitor) const
 MatchPhaseLimiter::MatchPhaseLimiter(uint32_t docIdLimit, Searchable &searchable_attributes,
                                      IRequestContext & requestContext,
                                      DegradationParams degradation, DiversityParams diversity,
-                                     const search::attribute::AttributeHistogram *histogram)
+                                     std::shared_ptr<const search::attribute::AttributeHistogram> histogram)
     : _postFilterMultiplier(degradation.post_filter_multiplier),
       _maxFilterCoverage(degradation.max_filter_coverage),
       _calculator(degradation.max_hits, diversity.min_groups, degradation.sample_percentage),
       _limiter_factory(searchable_attributes, requestContext, degradation.attribute, degradation.descending,
-                       diversity.attribute, diversity.cutoff_factor, diversity.cutoff_strategy, histogram),
+                       diversity.attribute, diversity.cutoff_factor, diversity.cutoff_strategy, std::move(histogram)),
       _coverage(docIdLimit)
 { }
 

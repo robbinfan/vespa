@@ -141,7 +141,7 @@ public:
                       search::queryeval::Searchable &searchable_attributes,
                       search::queryeval::IRequestContext & requestContext,
                       DegradationParams degradation, DiversityParams diversity,
-                      const search::attribute::AttributeHistogram *histogram = nullptr);
+                      std::shared_ptr<const search::attribute::AttributeHistogram> histogram = {});
     bool is_enabled() const override { return true; }
     bool was_limited() const override { return _limiter_factory.was_used(); }
     size_t sample_hits_per_thread(size_t num_threads) const override {

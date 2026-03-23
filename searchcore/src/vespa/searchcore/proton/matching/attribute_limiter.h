@@ -12,6 +12,8 @@
 
 namespace search::attribute { class AttributeHistogram; }
 
+#include <memory>
+
 namespace proton::matching {
     
 /**
@@ -32,7 +34,7 @@ public:
                      const vespalib::string &diversity_attribute,
                      double diversityCutoffFactor,
                      DiversityCutoffStrategy diversityCutoffStrategy,
-                     const search::attribute::AttributeHistogram *histogram = nullptr);
+                     std::shared_ptr<const search::attribute::AttributeHistogram> histogram = {});
     ~AttributeLimiter();
     search::queryeval::SearchIterator::UP create_search(size_t want_hits, size_t max_group_size, bool strictSearch, double match_freq = 0.0);
     bool was_used() const;
@@ -51,7 +53,7 @@ private:
     std::atomic<ssize_t>                       _estimatedHits;
     double                                     _diversityCutoffFactor;
     DiversityCutoffStrategy                    _diversityCutoffStrategy;
-    const search::attribute::AttributeHistogram *_histogram;
+    std::shared_ptr<const search::attribute::AttributeHistogram> _histogram;
 };
 
 }
