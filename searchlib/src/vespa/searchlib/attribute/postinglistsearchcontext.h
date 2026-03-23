@@ -2,7 +2,12 @@
 
 #pragma once
 
+#include "attribute_histogram.h"
 #include "enumstore.h"
+#include <cmath>
+#include <limits>
+#include <memory>
+#include <type_traits>
 #include "postinglisttraits.h"
 #include "postingstore.h"
 #include "ipostinglistsearchcontext.h"
@@ -47,6 +52,7 @@ protected:
     uint32_t                _minBvDocFreq;
     const GrowableBitVector *_gbv; // bitvector if _useBitVector has been set
     const ISearchContext    &_baseSearchCtx;
+    std::shared_ptr<const AttributeHistogram> _histogram; // nullable, shared ownership for thread safety
 
 
     PostingListSearchContext(const IEnumStoreDictionary& dictionary, uint32_t docIdLimit, uint64_t numValues, bool hasWeight,
@@ -136,6 +142,7 @@ protected:
 
     unsigned int singleHits() const;
     unsigned int approximateHits() const override;
+    size_t sampledHits() const;
     void applyRangeLimit(int rangeLimit);
 };
 
@@ -215,7 +222,25 @@ private:
             : Parent::fallbackToFiltering();
     }
     unsigned int approximateHits() const override {
-        const unsigned int estimate = PostingListSearchContextT<DataT>::approximateHits();
+        unsigned int estimate;
+        if (this->_histogram && this->_histogram->is_valid() && this->_uniqueValues >= 2) {
+            // For float/double types, use floor/ceil to avoid truncation errors
+            int64_t lo_int, hi_int;
+            if constexpr (std::is_floating_point_v<BaseType>) {
+                double lo_d = static_cast<double>(_low);
+                double hi_d = static_cast<double>(_high);
+                lo_d = std::max(lo_d, static_cast<double>(std::numeric_limits<int64_t>::min()));
+                hi_d = std::min(hi_d, static_cast<double>(std::numeric_limits<int64_t>::max()));
+                lo_int = static_cast<int64_t>(std::floor(lo_d));
+                hi_int = static_cast<int64_t>(std::ceil(hi_d));
+            } else {
+                lo_int = static_cast<int64_t>(_low);
+                hi_int = static_cast<int64_t>(_high);
+            }
+            estimate = this->_histogram->estimate(lo_int, hi_int);
+        } else {
+            estimate = PostingListSearchContextT<DataT>::approximateHits();
+        }
         const unsigned int limit = std::abs(this->getRangeLimit());
         return ((limit > 0) && (limit < estimate))
             ? limit
@@ -255,6 +280,9 @@ PostingSearchContext(QueryTermSimpleUP qTerm, bool useBitVector, const AttrT &to
       _enumStore(_toBeSearched.getEnumStore())
 {
     this->_plsc = static_cast<attribute::IPostingListSearchContext *>(this);
+    if (auto *posting_base = toBeSearched.getIPostingListAttributeBase()) {
+        this->_histogram = posting_base->get_histogram(); // shared_ptr copy keeps histogram alive
+    }
 }
 
 template <typename BaseSC, typename BaseSC2, typename AttrT>

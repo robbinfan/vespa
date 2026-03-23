@@ -1,10 +1,12 @@
 // Copyright Yahoo. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
 
 #include "postinglistattribute.h"
+#include "attribute_histogram.h"
 #include "loadednumericvalue.h"
 #include "enumcomparator.h"
 #include "enum_store_loaders.h"
 #include <vespa/vespalib/util/array.hpp>
+#include <type_traits>
 
 namespace search {
 
@@ -18,7 +20,9 @@ PostingListAttributeBase(AttributeVector &attr,
       _postingList(enumStore.get_dictionary(), attr.getStatus(),
                    attr.getConfig()),
       _attr(attr),
-      _dictionary(enumStore.get_dictionary())
+      _dictionary(enumStore.get_dictionary()),
+      _histogram(),
+      _histogram_dirty(true)
 { }
 
 template <typename P>
@@ -28,6 +32,7 @@ template <typename P>
 void
 PostingListAttributeBase<P>::clearAllPostings()
 {
+    _histogram_dirty = true;
     _postingList.clearBuilder();
     _attr.incGeneration(); // Force freeze
     auto clearer = [this](EntryRef posting_idx)
@@ -105,6 +110,9 @@ void
 PostingListAttributeBase<P>::updatePostings(PostingMap &changePost,
                                             const vespalib::datastore::EntryComparator &cmp)
 {
+    if (!changePost.empty()) {
+        _histogram_dirty = true;
+    }
     for (auto& elem : changePost) {
         EnumIndex idx = elem.first.getEnumIdx();
         auto& change = elem.second;
@@ -295,6 +303,64 @@ clearPostings(attribute::IAttributeVector::EnumHandle eidx, uint32_t fromLid, ui
     clearPostings(eidx, fromLid, toLid, _es.get_folded_comparator());
 }
 
+
+template <typename P, typename LoadedVector, typename LoadedValueType,
+          typename EnumStoreType>
+void
+PostingListAttributeSubBase<P, LoadedVector, LoadedValueType, EnumStoreType>::
+rebuild_histogram()
+{
+    if constexpr (std::is_same_v<LoadedValueType, const char*>) {
+        return; // Histogram not applicable for string attributes
+    } else {
+        if (!this->_histogram_dirty) {
+            return; // No posting list changes since last rebuild
+        }
+        this->_histogram_dirty = false;
+        if (!_dictionary.get_has_btree_dictionary()) {
+            return;
+        }
+        auto frozen = _dictionary.get_posting_dictionary().getFrozenView();
+        size_t dict_size = frozen.size();
+        if (dict_size <= 1) {
+            this->_histogram = std::shared_ptr<const attribute::AttributeHistogram>();
+            return;
+        }
+
+        // Single pass: find min/max and collect (value, count) pairs
+        auto itr = frozen.begin();
+        int64_t min_val = std::numeric_limits<int64_t>::max();
+        int64_t max_val = std::numeric_limits<int64_t>::min();
+
+        // Small buffer to avoid second pass for most cases
+        struct ValCount { int64_t val; uint32_t count; };
+        std::vector<ValCount> entries;
+        entries.reserve(dict_size);
+
+        for (; itr.valid(); ++itr) {
+            auto enum_idx = itr.getKey().load_acquire();
+            auto posting_ref = itr.getData().load_acquire();
+            int64_t value = static_cast<int64_t>(_es.get_value(enum_idx));
+            uint32_t doc_count = this->_postingList.frozenSize(posting_ref);
+            if (value < min_val) min_val = value;
+            if (value > max_val) max_val = value;
+            entries.push_back({value, doc_count});
+        }
+
+        if (min_val >= max_val) {
+            this->_histogram = std::shared_ptr<const attribute::AttributeHistogram>();
+            return;
+        }
+
+        auto hist = std::make_shared<attribute::AttributeHistogram>();
+        hist->reset(min_val, max_val);
+        for (auto& e : entries) {
+            hist->add(e.val, e.count);
+        }
+        // Atomic swap: readers holding the old shared_ptr stay safe
+        this->_histogram = std::move(hist);
+    }
+}
 
 template class PostingListAttributeBase<AttributePosting>;
 template class PostingListAttributeBase<AttributeWeightPosting>;

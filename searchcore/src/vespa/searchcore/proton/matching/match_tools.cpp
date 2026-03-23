@@ -6,9 +6,12 @@
 #include <vespa/searchlib/fef/indexproperties.h>
 #include <vespa/searchlib/fef/ranksetup.h>
 #include <vespa/searchlib/engine/trace.h>
+#include <vespa/searchlib/attribute/attribute_histogram.h>
+#include <vespa/searchlib/attribute/attributevector.h>
 #include <vespa/searchlib/attribute/diversity.h>
 #include <vespa/searchlib/attribute/attribute_operation.h>
 #include <vespa/searchlib/attribute/attribute_blueprint_params.h>
+#include <vespa/searchlib/attribute/ipostinglistattributebase.h>
 #include <vespa/vespalib/util/issue.h>
 
 #include <vespa/log/log.h>
@@ -71,6 +74,19 @@ AttributeBlueprintParams
 extractAttributeBlueprintParams(const RankSetup& rank_setup, const Properties &rankProperties)
 {
     return AttributeBlueprintParams(NearestNeighborBruteForceLimit::lookup(rankProperties, rank_setup.get_nearest_neighbor_brute_force_limit()));
+}
+
+std::shared_ptr<const search::attribute::AttributeHistogram>
+extract_histogram(IAttributeContext &attrCtx, const vespalib::string &attr_name)
+{
+    if (attr_name.empty()) return {};
+    auto *attr_vec = attrCtx.getAttribute(attr_name);
+    if (!attr_vec) return {};
+    auto *av = dynamic_cast<const search::AttributeVector *>(attr_vec);
+    if (!av) return {};
+    auto *posting_base = av->getIPostingListAttributeBase();
+    if (!posting_base) return {};
+    return posting_base->get_histogram();
 }
 
 } // namespace proton::matching::<unnamed>
@@ -215,8 +231,9 @@ MatchToolsFactory(QueryLimiter               & queryLimiter,
 
         if (degradationParams.enabled()) {
             trace.addEvent(5, "MTF: Build MatchPhaseLimiter");
+            auto histogram = extract_histogram(attributeContext, degradationParams.attribute);
             _match_limiter = std::make_unique<MatchPhaseLimiter>(metaStore.getCommittedDocIdLimit(), searchContext.getAttributes(),
-                                                                 _requestContext, degradationParams, _diversityParams);
+                                                                 _requestContext, degradationParams, _diversityParams, std::move(histogram));
         }
     }
     if ( ! _match_limiter) {

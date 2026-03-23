@@ -186,6 +186,9 @@ AttributeVector::commit(bool forceUpdateStats)
 {
     onCommit();
     updateCommittedDocIdLimit();
+    if (auto *posting_base = getIPostingListAttributeBase()) {
+        posting_base->rebuild_histogram();
+    }
     updateStat(forceUpdateStats);
     _loaded = true;
 }

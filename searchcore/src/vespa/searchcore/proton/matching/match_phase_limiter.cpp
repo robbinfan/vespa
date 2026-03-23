@@ -70,12 +70,13 @@ LimitedSearch::visitMembers(vespalib::ObjectVisitor &visitor) const
 
 MatchPhaseLimiter::MatchPhaseLimiter(uint32_t docIdLimit, Searchable &searchable_attributes,
                                      IRequestContext & requestContext,
-                                     DegradationParams degradation, DiversityParams diversity)
+                                     DegradationParams degradation, DiversityParams diversity,
+                                     std::shared_ptr<const search::attribute::AttributeHistogram> histogram)
     : _postFilterMultiplier(degradation.post_filter_multiplier),
       _maxFilterCoverage(degradation.max_filter_coverage),
       _calculator(degradation.max_hits, diversity.min_groups, degradation.sample_percentage),
       _limiter_factory(searchable_attributes, requestContext, degradation.attribute, degradation.descending,
-                       diversity.attribute, diversity.cutoff_factor, diversity.cutoff_strategy),
+                       diversity.attribute, diversity.cutoff_factor, diversity.cutoff_strategy, std::move(histogram)),
       _coverage(docIdLimit)
 { }
 
@@ -85,9 +86,9 @@ template <bool PRE_FILTER>
 SearchIterator::UP
 do_limit(AttributeLimiter &limiter_factory, SearchIterator::UP search,
          size_t wanted_num_docs, size_t max_group_size,
-         uint32_t current_id, uint32_t end_id)
+         uint32_t current_id, uint32_t end_id, double match_freq)
 {
-    SearchIterator::UP limiter = limiter_factory.create_search(wanted_num_docs, max_group_size, PRE_FILTER);
+    SearchIterator::UP limiter = limiter_factory.create_search(wanted_num_docs, max_group_size, PRE_FILTER, match_freq);
     limiter = search->andWith(std::move(limiter), wanted_num_docs);
     if (limiter) {
         search = std::make_unique<LimitedSearchT<PRE_FILTER>>(std::move(limiter), std::move(search));
@@ -135,8 +136,8 @@ MatchPhaseLimiter::maybe_limit(SearchIterator::UP search, double match_freq, siz
         use_pre_filter ? "pre" : "post", match_freq, num_docs, max_filter_docs, wanted_num_docs,
         max_group_size, current_id, end_id, total_query_hits);
     return (use_pre_filter)
-        ? do_limit<true>(_limiter_factory, std::move(search), wanted_num_docs, max_group_size, current_id, end_id)
-        : do_limit<false>(_limiter_factory, std::move(search), wanted_num_docs, max_group_size, current_id, end_id);
+        ? do_limit<true>(_limiter_factory, std::move(search), wanted_num_docs, max_group_size, current_id, end_id, match_freq)
+        : do_limit<false>(_limiter_factory, std::move(search), wanted_num_docs, max_group_size, current_id, end_id, match_freq);
 }
 
 void

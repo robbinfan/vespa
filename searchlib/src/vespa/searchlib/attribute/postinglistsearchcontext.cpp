@@ -34,7 +34,8 @@ PostingListSearchContext(const IEnumStoreDictionary& dictionary,
       _PLSTC(0.0),
       _minBvDocFreq(minBvDocFreq),
       _gbv(nullptr),
-      _baseSearchCtx(baseSearchCtx)
+      _baseSearchCtx(baseSearchCtx),
+      _histogram()
 {
 }
 
