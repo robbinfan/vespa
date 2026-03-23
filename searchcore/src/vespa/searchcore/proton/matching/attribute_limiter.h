@@ -10,6 +10,8 @@
 #include <vespa/searchlib/fef/matchdata.h>
 #include <mutex>
 
+namespace search::attribute { class AttributeHistogram; }
+
 namespace proton::matching {
     
 /**
@@ -29,9 +31,10 @@ public:
                      const vespalib::string &attribute_name, bool descending,
                      const vespalib::string &diversity_attribute,
                      double diversityCutoffFactor,
-                     DiversityCutoffStrategy diversityCutoffStrategy);
+                     DiversityCutoffStrategy diversityCutoffStrategy,
+                     const search::attribute::AttributeHistogram *histogram = nullptr);
     ~AttributeLimiter();
-    search::queryeval::SearchIterator::UP create_search(size_t want_hits, size_t max_group_size, bool strictSearch);
+    search::queryeval::SearchIterator::UP create_search(size_t want_hits, size_t max_group_size, bool strictSearch, double match_freq = 0.0);
     bool was_used() const;
     ssize_t getEstimatedHits() const;
     static DiversityCutoffStrategy toDiversityCutoffStrategy(vespalib::stringref strategy);
@@ -48,6 +51,7 @@ private:
     std::atomic<ssize_t>                       _estimatedHits;
     double                                     _diversityCutoffFactor;
     DiversityCutoffStrategy                    _diversityCutoffStrategy;
+    const search::attribute::AttributeHistogram *_histogram;
 };
 
 }

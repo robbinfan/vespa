@@ -1,10 +1,14 @@
 // Copyright Yahoo. Licensed under the terms of the Apache 2.0 license. See LICENSE in the project root.
 
 #include "attribute_limiter.h"
+#include <vespa/searchlib/attribute/attribute_histogram.h>
 #include <vespa/vespalib/util/stringfmt.h>
 #include <vespa/searchlib/fef/matchdatalayout.h>
 #include <vespa/searchlib/query/tree/range.h>
 #include <vespa/searchlib/query/tree/simplequery.h>
+
+#include <vespa/log/log.h>
+LOG_SETUP(".proton.matching.attribute_limiter");
 
 using namespace search::queryeval;
 using namespace search::query;
@@ -19,7 +23,8 @@ AttributeLimiter::AttributeLimiter(Searchable &searchable_attributes,
                                    bool descending,
                                    const string &diversity_attribute,
                                    double diversityCutoffFactor,
-                                   DiversityCutoffStrategy diversityCutoffStrategy)
+                                   DiversityCutoffStrategy diversityCutoffStrategy,
+                                   const search::attribute::AttributeHistogram *histogram)
     : _searchable_attributes(searchable_attributes),
       _requestContext(requestContext),
       _attribute_name(attribute_name),
@@ -30,7 +35,8 @@ AttributeLimiter::AttributeLimiter(Searchable &searchable_attributes,
       _blueprint(),
       _estimatedHits(-1),
       _diversityCutoffFactor(diversityCutoffFactor),
-      _diversityCutoffStrategy(diversityCutoffStrategy)
+      _diversityCutoffStrategy(diversityCutoffStrategy),
+      _histogram(histogram)
 {
 }
 
@@ -68,7 +74,7 @@ AttributeLimiter::toString(DiversityCutoffStrategy strategy)
 }
 
 SearchIterator::UP
-AttributeLimiter::create_search(size_t want_hits, size_t max_group_size, bool strictSearch)
+AttributeLimiter::create_search(size_t want_hits, size_t max_group_size, bool strictSearch, double match_freq)
 {
     std::lock_guard<std::mutex> guard(_lock);
     const uint32_t my_field_id = 0;
@@ -76,14 +82,54 @@ AttributeLimiter::create_search(size_t want_hits, size_t max_group_size, bool st
     auto my_handle = layout.allocTermField(my_field_id);
     if ( ! _blueprint ) {
         const uint32_t no_unique_id = 0;
-        string range_spec = make_string("[;;%s%zu", (_descending)? "-" : "", want_hits);
-        if (max_group_size < want_hits) {
-            size_t cutoffGroups = (_diversityCutoffFactor*want_hits)/max_group_size;
-            range_spec.append(make_string(";%s;%zu;%zu;%s]", _diversity_attribute.c_str(), max_group_size,
-                                          cutoffGroups, toString(_diversityCutoffStrategy).c_str()));
+        string range_spec;
+
+        // Use histogram for value-based bounds only when:
+        // 1. Histogram is available and valid
+        // 2. No diversity (diversity needs count-based limiting)
+        // 3. hit_ratio is high enough (>= 0.1) that the query touches many docs
+        //    and limiting provides substantial benefit.
+        //    For low hit_ratio, the query is already selective enough.
+        //
+        // The histogram replaces count-based "[;;-N]" with a precise value range
+        // "[;V]" (ascending) or "[V;]" (descending). We use a 2x safety
+        // multiplier on want_hits because:
+        // - histogram buckets have finite resolution (~0.1% error)
+        // - want_hits is already divided by hit_rate, slight undercount
+        //   means fewer results than max_hits after query filtering
+        // - 2x overhead is still much less than full corpus scan
+        static constexpr double histogram_activation_threshold = 0.1;
+        bool use_histogram = (_histogram && _histogram->is_valid()
+                              && max_group_size >= want_hits
+                              && match_freq >= histogram_activation_threshold);
+
+        if (use_histogram) {
+            bool ascending = !_descending;
+            // Dynamic k: 2x want_hits for safety margin.
+            // At high hit_ratio this still cuts the candidate set dramatically
+            // (e.g., hit_ratio=0.5, want_hits=20000, k=40000 vs full corpus of millions)
+            size_t k = want_hits * 2;
+            int64_t threshold = _histogram->estimate_threshold_for_count(
+                static_cast<uint32_t>(k), ascending);
+            if (ascending) {
+                range_spec = make_string("[;%ld]", threshold);
+            } else {
+                range_spec = make_string("[%ld;]", threshold);
+            }
+            LOG(debug, "Histogram-guided limiter: attr=%s, want_hits=%zu, k=%zu, match_freq=%g, %s, threshold=%ld",
+                _attribute_name.c_str(), want_hits, k, match_freq, ascending ? "ASC" : "DESC", threshold);
         } else {
-            range_spec.push_back(']');
+            // Fallback: count-based range limit (original behavior)
+            range_spec = make_string("[;;%s%zu", (_descending)? "-" : "", want_hits);
+            if (max_group_size < want_hits) {
+                size_t cutoffGroups = (_diversityCutoffFactor*want_hits)/max_group_size;
+                range_spec.append(make_string(";%s;%zu;%zu;%s]", _diversity_attribute.c_str(), max_group_size,
+                                              cutoffGroups, toString(_diversityCutoffStrategy).c_str()));
+            } else {
+                range_spec.push_back(']');
+            }
         }
+
         Range range(range_spec);
         SimpleRangeTerm node(range, _attribute_name, no_unique_id, Weight(0));
         FieldSpecList field; // single field API is protected

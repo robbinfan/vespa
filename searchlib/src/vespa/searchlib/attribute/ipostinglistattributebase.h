@@ -10,6 +10,8 @@ namespace vespalib { class MemoryUsage; }
 
 namespace search::attribute {
 
+class AttributeHistogram;
+
 class IPostingListAttributeBase
 {
 public:
@@ -20,6 +22,8 @@ public:
     virtual vespalib::MemoryUsage getMemoryUsage() const = 0;
     virtual bool consider_compact_worst_btree_nodes(const CompactionStrategy& compaction_strategy) = 0;
     virtual bool consider_compact_worst_buffers(const CompactionStrategy& compaction_strategy) = 0;
+    virtual void rebuild_histogram() {}
+    virtual const AttributeHistogram* get_histogram() const { return nullptr; }
 };
 
 } // namespace search::attribute

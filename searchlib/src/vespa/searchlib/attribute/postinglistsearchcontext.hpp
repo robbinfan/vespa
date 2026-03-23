@@ -231,6 +231,44 @@ PostingListSearchContextT<DataT>::singleHits() const
     return frozenView.size();
 }
 
+/**
+ * Estimate hit count by sampling posting list sizes at regular intervals
+ * within the range. This provides much better accuracy than the uniform
+ * distribution assumption (calculateApproxNumHits) for skewed data
+ * distributions, at the cost of iterating through up to
+ * (step * NUM_SAMPLES) dictionary entries.
+ *
+ * The iteration cost is bounded: we stop after collecting NUM_SAMPLES
+ * samples, so at most ~_uniqueValues entries are visited but only
+ * NUM_SAMPLES frozenSize() calls are made.
+ */
+template <typename DataT>
+size_t
+PostingListSearchContextT<DataT>::sampledHits() const
+{
+    static constexpr uint32_t NUM_SAMPLES = 16;
+    uint32_t step = _uniqueValues / NUM_SAMPLES;
+    if (step == 0) {
+        step = 1;
+    }
+    uint32_t samples_taken = 0;
+    size_t sampled_sum = 0;
+    uint32_t pos = 0;
+    uint32_t next_sample = 0;
+    for (auto it(_lowerDictItr); it != _upperDictItr && samples_taken < NUM_SAMPLES; ++it, ++pos) {
+        if (pos == next_sample) {
+            sampled_sum += _postingList.frozenSize(it.getData().load_acquire());
+            ++samples_taken;
+            next_sample += step;
+        }
+    }
+    if (samples_taken == 0) {
+        return 0;
+    }
+    double avg_per_value = static_cast<double>(sampled_sum) / samples_taken;
+    return static_cast<size_t>(avg_per_value * _uniqueValues);
+}
+
 template <typename DataT>
 unsigned int
 PostingListSearchContextT<DataT>::approximateHits() const
@@ -247,13 +285,11 @@ PostingListSearchContextT<DataT>::approximateHits() const
                 (this->calculateApproxNumHits() * MIN_APPROXHITS_TO_NUMDOCS_RATIO_BEFORE_APPROXIMATION > _docIdLimit) ||
                 (_uniqueValues > MIN_UNIQUE_VALUES_BEFORE_APPROXIMATION*10))
             {
-                numHits = this->calculateApproxNumHits();
+                numHits = sampledHits();
             } else {
-                // XXX: Unsafe
                 numHits = countHits();
             }
         } else {
-            // XXX: Unsafe
             numHits = countHits();
         }
     }

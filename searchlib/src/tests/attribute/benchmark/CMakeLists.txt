@@ -5,3 +5,15 @@ vespa_add_executable(searchlib_attributebenchmark_app
     DEPENDS
     searchlib
 )
+vespa_add_executable(searchlib_range_estimation_benchmark_app
+    SOURCES
+    range_estimation_benchmark.cpp
+    DEPENDS
+    searchlib
+)
+vespa_add_executable(searchlib_limiter_histogram_eval_app
+    SOURCES
+    limiter_histogram_eval.cpp
+    DEPENDS
+    searchlib
+)

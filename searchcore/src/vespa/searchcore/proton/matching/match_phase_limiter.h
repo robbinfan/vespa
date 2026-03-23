@@ -5,6 +5,7 @@
 #include "match_phase_limit_calculator.h"
 #include "attribute_limiter.h"
 
+#include <vespa/searchlib/attribute/attribute_histogram.h>
 #include <vespa/searchlib/queryeval/searchable.h>
 #include <vespa/vespalib/stllike/string.h>
 #include <vespa/searchlib/queryeval/searchiterator.h>
@@ -139,7 +140,8 @@ public:
     MatchPhaseLimiter(uint32_t docIdLimit,
                       search::queryeval::Searchable &searchable_attributes,
                       search::queryeval::IRequestContext & requestContext,
-                      DegradationParams degradation, DiversityParams diversity);
+                      DegradationParams degradation, DiversityParams diversity,
+                      const search::attribute::AttributeHistogram *histogram = nullptr);
     bool is_enabled() const override { return true; }
     bool was_limited() const override { return _limiter_factory.was_used(); }
     size_t sample_hits_per_thread(size_t num_threads) const override {

@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "attribute_histogram.h"
 #include "enumstore.h"
 #include "postinglisttraits.h"
 #include "postingstore.h"
@@ -47,6 +48,7 @@ protected:
     uint32_t                _minBvDocFreq;
     const GrowableBitVector *_gbv; // bitvector if _useBitVector has been set
     const ISearchContext    &_baseSearchCtx;
+    const AttributeHistogram *_histogram; // nullable, owned by attribute
 
 
     PostingListSearchContext(const IEnumStoreDictionary& dictionary, uint32_t docIdLimit, uint64_t numValues, bool hasWeight,
@@ -136,6 +138,7 @@ protected:
 
     unsigned int singleHits() const;
     unsigned int approximateHits() const override;
+    size_t sampledHits() const;
     void applyRangeLimit(int rangeLimit);
 };
 
@@ -215,7 +218,13 @@ private:
             : Parent::fallbackToFiltering();
     }
     unsigned int approximateHits() const override {
-        const unsigned int estimate = PostingListSearchContextT<DataT>::approximateHits();
+        unsigned int estimate;
+        if (this->_histogram && this->_histogram->is_valid() && this->_uniqueValues >= 2) {
+            estimate = this->_histogram->estimate(static_cast<int64_t>(_low),
+                                                  static_cast<int64_t>(_high));
+        } else {
+            estimate = PostingListSearchContextT<DataT>::approximateHits();
+        }
         const unsigned int limit = std::abs(this->getRangeLimit());
         return ((limit > 0) && (limit < estimate))
             ? limit
@@ -255,6 +264,9 @@ PostingSearchContext(QueryTermSimpleUP qTerm, bool useBitVector, const AttrT &to
       _enumStore(_toBeSearched.getEnumStore())
 {
     this->_plsc = static_cast<attribute::IPostingListSearchContext *>(this);
+    if (auto *posting_base = toBeSearched.getIPostingListAttributeBase()) {
+        this->_histogram = posting_base->get_histogram();
+    }
 }
 
 template <typename BaseSC, typename BaseSC2, typename AttrT>

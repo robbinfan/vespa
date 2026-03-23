@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "attribute_histogram.h"
 #include "dociditerator.h"
 #include "ipostinglistattributebase.h"
 #include "postingchange.h"
@@ -14,6 +15,7 @@
 #include <vespa/vespalib/datastore/entry_comparator.h>
 #include <vespa/vespalib/datastore/entryref.h>
 #include <map>
+#include <memory>
 
 namespace search {
 
@@ -49,6 +51,7 @@ protected:
     PostingList _postingList;
     AttributeVector &_attr;
     IEnumStoreDictionary& _dictionary;
+    std::unique_ptr<attribute::AttributeHistogram> _histogram;
 
     PostingListAttributeBase(AttributeVector &attr, IEnumStore &enumStore);
     ~PostingListAttributeBase() override;
@@ -73,6 +76,7 @@ protected:
 public:
     const PostingList & getPostingList() const { return _postingList; }
     PostingList & getPostingList()             { return _postingList; }
+    const attribute::AttributeHistogram* get_histogram() const override { return _histogram.get(); }
 };
 
 template <typename P, typename LoadedVector, typename LoadedValueType,
@@ -107,6 +111,7 @@ public:
     void handle_load_posting_lists(LoadedVector &loaded);
     void updatePostings(PostingMap &changePost) override;
     void clearPostings(attribute::IAttributeVector::EnumHandle eidx, uint32_t fromLid, uint32_t toLid) override;
+    void rebuild_histogram() override;
 };
 
 extern template class PostingListAttributeBase<AttributePosting>;
