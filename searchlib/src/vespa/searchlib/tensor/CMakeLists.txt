@@ -16,7 +16,10 @@ vespa_add_library(searchlib_tensor OBJECT
     geo_degrees_distance.cpp
     hamming_distance.cpp
     hash_set_visited_tracker.cpp
+    hnsw_disk_index.cpp
+    hnsw_flush_target.cpp
     hnsw_graph.cpp
+    hnsw_hybrid_index.cpp
     hnsw_index.cpp
     hnsw_index_saver.cpp
     imported_tensor_attribute_vector.cpp
@@ -25,6 +28,7 @@ vespa_add_library(searchlib_tensor OBJECT
     inv_log_level_generator.cpp
     nearest_neighbor_index.cpp
     nearest_neighbor_index_saver.cpp
+    scalar_quantizer.cpp
     serialized_fast_value_attribute.cpp
     streamed_value_saver.cpp
     streamed_value_store.cpp
@@ -32,5 +36,6 @@ vespa_add_library(searchlib_tensor OBJECT
     tensor_deserialize.cpp
     tensor_store.cpp
     reusable_set_visited_tracker.cpp
+    vector_compressor.cpp
     DEPENDS
 )

@@ -50,3 +50,38 @@ attribute[].index.hnsw.neighborstoexploreatinsert int default=200
 attribute[].index.hnsw.distancemetric enum { EUCLIDEAN, ANGULAR, GEODEGREES, HAMMING } default=EUCLIDEAN
 # Whether multi-threaded indexing is enabled for this hnsw index.
 attribute[].index.hnsw.multithreadedindexing bool default=true
+
+# Hybrid disk index for hnsw (memory flush + fusion).
+# When enabled, the in-memory HNSW index is periodically flushed to disk
+# (hnsw.flush.<id>/) and multiple flush indexes are merged via fusion
+# (hnsw.fusion.<id>/), analogous to the inverted index architecture.
+attribute[].index.hnsw.diskindex.enabled bool default=false
+
+# Flush the memory index to disk when the number of indexed documents exceeds this.
+attribute[].index.hnsw.diskindex.flushthresholddocs int default=100000
+
+# Flush the memory index to disk when its memory footprint exceeds this (MB).
+attribute[].index.hnsw.diskindex.flushthresholdmb int default=2048
+
+# Trigger fusion when the number of flush disk indexes exceeds this.
+attribute[].index.hnsw.diskindex.maxflushindexes int default=8
+
+# Trigger fusion when the alive-document ratio of any disk index drops below
+# (1 - tombstoneratiolimit), i.e. when too many documents have been deleted.
+attribute[].index.hnsw.diskindex.tombstoneratiolimit double default=0.2
+
+# Vector compression applied during fusion (not during flush).
+# NONE     - no compression, store float32 (default, backward compatible)
+# INT8     - scalar uniform quantization, ~4x compression, minor recall loss
+# BFLOAT16 - truncate to brain-float16, 2x compression, negligible recall loss
+# RABITQ   - random binary quantization, ~32x compression, requires ADC reranking
+# BBQ      - better binary quantization, tunable bits-per-dim
+attribute[].index.hnsw.diskindex.fusioncompression \
+    enum { NONE, INT8, BFLOAT16, RABITQ, BBQ } default=NONE
+
+# For BBQ: bits per dimension (1-8).  Higher = better recall, larger index.
+attribute[].index.hnsw.diskindex.bbqbitsperdim int default=4
+
+# Number of candidates to fetch from compressed disk indexes before reranking
+# with exact distances.  Only relevant when fusioncompression is RABITQ or BBQ.
+attribute[].index.hnsw.diskindex.rerankcandidates int default=100

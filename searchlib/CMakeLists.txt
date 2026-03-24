@@ -220,6 +220,7 @@ vespa_define_module(
     src/tests/tensor/dense_tensor_store
     src/tests/tensor/direct_tensor_store
     src/tests/tensor/distance_functions
+    src/tests/tensor/hnsw_hybrid
     src/tests/tensor/hnsw_index
     src/tests/tensor/hnsw_saver
     src/tests/transactionlog
