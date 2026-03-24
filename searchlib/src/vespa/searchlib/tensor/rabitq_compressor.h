@@ -59,6 +59,8 @@ public:
         return vespalib::eval::CellType::INT8;  // treated as raw bytes
     }
 
+    CompressionType compression_type() const override { return CompressionType::RABITQ; }
+
     void save_params(BufferWriter& writer) const override;
     void load_params(const void* data, size_t len) override;
 

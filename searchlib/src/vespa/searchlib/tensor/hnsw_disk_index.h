@@ -131,6 +131,10 @@ private:
         uint32_t count;
     };
 
+    // Atomically rewrite alive.dat from the in-memory BitVector.
+    // Caller must hold _alive_mutex.
+    void persist_alive() const;
+
     // Greedy HNSW search layer helper
     void search_layer(const float* query_vec,
                       uint32_t   entry_local,

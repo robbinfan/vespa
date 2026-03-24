@@ -48,6 +48,11 @@ public:
 
     vespalib::eval::CellType cell_type() const override { return CT; }
 
+    CompressionType compression_type() const override {
+        if constexpr (CT == vespalib::eval::CellType::INT8) return CompressionType::INT8;
+        else return CompressionType::BFLOAT16;
+    }
+
     void save_params(BufferWriter& writer) const override;
 
     void load_params(const void* data, size_t len) override;

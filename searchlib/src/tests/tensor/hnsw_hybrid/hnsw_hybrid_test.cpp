@@ -283,7 +283,7 @@ TEST_F(HnswHybridTest, hybrid_index_basic_search)
 
     auto hnsw = make_hnsw(vecs);
     HnswHybridIndex::Config cfg;
-    HnswHybridIndex hybrid(std::move(hnsw), test_dir(), cfg);
+    HnswHybridIndex hybrid(std::move(hnsw), vecs, test_dir(), cfg);
 
     // Insert documents into memory index
     for (uint32_t id : {1u, 2u, 3u, 4u}) {

@@ -206,6 +206,27 @@ double HnswDiskIndex::alive_ratio() const
     return static_cast<double>(alive_count()) / _meta.num_docs;
 }
 
+void HnswDiskIndex::persist_alive() const
+{
+    // Caller must hold _alive_mutex.
+    // Write alive bits to a temp file then atomically rename over the live file.
+    string d = dir();
+    string final_path = d + "/alive.dat";
+    string tmp_path   = d + "/alive.dat.tmp";
+
+    uint32_t n = _meta.num_docs;
+    size_t bytes = (n + 7) / 8;
+    std::vector<uint8_t> abuf(bytes, 0);
+    for (uint32_t i = 0; i < n; ++i) {
+        if (_alive->testBit(i)) abuf[i / 8] |= uint8_t(1 << (i % 8));
+    }
+    if (write_file(tmp_path, abuf.data(), abuf.size())) {
+        std::rename(tmp_path.c_str(), final_path.c_str());
+    } else {
+        LOG(warning, "HnswDiskIndex: failed to persist alive.dat for id %u", _id);
+    }
+}
+
 void HnswDiskIndex::remove_document(uint32_t global_docid)
 {
     std::lock_guard guard(_alive_mutex);
@@ -213,6 +234,7 @@ void HnswDiskIndex::remove_document(uint32_t global_docid)
     for (uint32_t i = 0; i < _docid_map.size(); ++i) {
         if (_docid_map[i] == global_docid && _alive->testBit(i)) {
             _alive->clearBit(i);
+            persist_alive();
             return;
         }
     }
@@ -413,9 +435,7 @@ bool HnswDiskIndex::write(const vespalib::string& base_dir,
     meta.entry_docid      = (entry_local_id < n) ? global_docids[entry_local_id] : 0;
     meta.entry_level      = entry_level;
     meta.compression_type = static_cast<uint32_t>(
-        compressor ? compressor->cell_type() == vespalib::eval::CellType::INT8
-                         ? VectorCompressor::CompressionType::INT8
-                         : VectorCompressor::CompressionType::BFLOAT16
+        compressor ? compressor->compression_type()
                    : VectorCompressor::CompressionType::NONE);
     if (!write_file(d + "/meta.dat", &meta, sizeof(meta))) return false;
 

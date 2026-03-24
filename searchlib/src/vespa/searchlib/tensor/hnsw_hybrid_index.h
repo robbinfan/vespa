@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "doc_vector_access.h"
 #include "nearest_neighbor_index.h"
 #include "prepare_result.h"
 #include "hnsw_index.h"
@@ -55,7 +56,15 @@ public:
         uint32_t rerank_candidates{100};
     };
 
+    /**
+     * @param memory_index  In-memory HNSW index (the write buffer).
+     * @param vectors       DocVectorAccess for reading float32 vectors by global docid.
+     *                      Typically backed by DenseTensorStore; must outlive this object.
+     * @param base_dir      Directory under which flush/fusion subdirectories are created.
+     * @param cfg           Hybrid index configuration.
+     */
     HnswHybridIndex(std::unique_ptr<HnswIndex> memory_index,
+                    const DocVectorAccess& vectors,
                     vespalib::stringref base_dir,
                     const Config& cfg);
 
@@ -109,15 +118,16 @@ public:
     bool needs_fusion() const;
 
     /**
-     * Flush the current memory index to a new disk index.
-     * Returns the new flush id on success, or 0 on failure.
-     * Must be called off the attribute writer thread.
+     * Flush the current memory index to a new hnsw.flush.<id>/ directory.
+     * Reads float32 vectors via the DocVectorAccess supplied at construction.
      *
-     * @param global_docids  mapping from HnswIndex internal docid → global docid
-     * @param alive          BitVector marking live documents (indexed by HnswIndex docid)
+     * @param committed_doc_id_limit  One-past-the-last committed docid.
+     *                                Docids 0..committed_doc_id_limit-1 are considered.
+     * @return flush id (>0) on success, 0 on failure or empty index.
+     *
+     * Must be called off the attribute writer thread.
      */
-    uint32_t flush_memory_index(const std::vector<uint32_t>& global_docids,
-                                const search::BitVector& alive);
+    uint32_t flush_memory_index(uint32_t committed_doc_id_limit);
 
     /**
      * Merge all existing disk indexes into one fusion index and optionally
@@ -141,7 +151,16 @@ private:
         std::vector<std::vector<Neighbor>> disk_results,
         uint32_t k) const;
 
+    /**
+     * Exact rescore of candidates using float32 vectors from DocVectorAccess.
+     * Called after disk index search when lossy compression is active.
+     */
+    std::vector<Neighbor> exact_rescore(std::vector<Neighbor> candidates,
+                                        TypedCells query,
+                                        uint32_t k) const;
+
     std::unique_ptr<HnswIndex> _memory_index;
+    const DocVectorAccess&     _vectors;
     vespalib::string _base_dir;
     Config _cfg;
 

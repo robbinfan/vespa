@@ -77,6 +77,9 @@ public:
      */
     virtual void load_params(const void* data, size_t len) = 0;
 
+    /** The CompressionType enum value that identifies this compressor. */
+    virtual CompressionType compression_type() const = 0;
+
     /** Factory: create a compressor of the given type. */
     static UP create(CompressionType type);
 };
