@@ -2,6 +2,7 @@
 vespa_add_library(searchlib_tensor OBJECT
     SOURCES
     angular_distance.cpp
+    bbq_compressor.cpp
     bitvector_visited_tracker.cpp
     blob_sequence_reader.cpp
     default_nearest_neighbor_index_factory.cpp
@@ -35,6 +36,7 @@ vespa_add_library(searchlib_tensor OBJECT
     tensor_attribute.cpp
     tensor_deserialize.cpp
     tensor_store.cpp
+    rabitq_compressor.cpp
     reusable_set_visited_tracker.cpp
     vector_compressor.cpp
     DEPENDS

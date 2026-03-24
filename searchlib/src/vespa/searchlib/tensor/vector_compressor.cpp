@@ -2,6 +2,8 @@
 
 #include "vector_compressor.h"
 #include "scalar_quantizer.h"
+#include "rabitq_compressor.h"
+#include "bbq_compressor.h"
 #include <vespa/vespalib/stllike/string.h>
 #include <stdexcept>
 
@@ -22,11 +24,9 @@ VectorCompressor::UP VectorCompressor::create(CompressionType type)
     case CompressionType::BFLOAT16:
         return std::make_unique<ScalarQuantizer<CT::BFLOAT16>>();
     case CompressionType::RABITQ:
-        // Placeholder: fall through to INT8 until RaBitQCompressor is implemented.
-        return std::make_unique<ScalarQuantizer<CT::INT8>>();
+        return std::make_unique<RaBitQCompressor>();
     case CompressionType::BBQ:
-        // Placeholder: fall through to INT8 until BBQCompressor is implemented.
-        return std::make_unique<ScalarQuantizer<CT::INT8>>();
+        return std::make_unique<BBQCompressor>();
     default:
         throw std::invalid_argument("VectorCompressor::create: unknown CompressionType");
     }
