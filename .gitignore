@@ -51,3 +51,5 @@ Testing
 install_manifest.txt
 *.cbp
 !/.copr/Makefile
+.claude/tools/trex/trex
+.claude/trigram-index.bin
