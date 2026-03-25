@@ -377,3 +377,82 @@ AND/OR 计划树，是被要求认真读 Russ Cox 的论文之后才真正吸收
 最后建出来的东西，能在同一个对话里和 zoekt、ripgrep 放在一起比较，每一个结论都有数字支撑。这是因为标准从来没有被允许停在它落下的地方。
 
 谢谢你不让"够用"成为终点。
+
+---
+
+## Design diary: conversations that shaped trex
+
+This tool was built in a single long conversation between a human and Claude.
+Below are the key turning points — the moments where a question, a reference,
+or a challenge changed the direction of the design.
+
+---
+
+**"看看这个 Cursor 的 blog"** — The starting point. The idea that a trigram
+index could make code search fast enough for an AI assistant to use in real time.
+v1 was a direct implementation of this: sliding window, inverted index, intersect,
+verify. It worked. 55ms, 80MB index, wrong answers on OR patterns.
+
+**"加进来，然后再评测"** — The principle that stuck through every iteration:
+implement first, measure immediately. No theoretical arguments about whether
+something would help. Build it, time it, compare it. This discipline killed
+several "obviously good" ideas that turned out to be neutral, and validated
+others that seemed marginal (bloom filter: only 3 candidates eliminated, but
+the approach compounds on longer phrases).
+
+**"看看 zoekt 的代码，再好好吸收些好的东西"** — This led to reading zoekt's
+`regexpInfo` and `extractStringLiterals`. The critical insight: the old
+`extractLiterals` approach ANDed all literals together, which is wrong for
+alternation patterns. `(void|bool).*run\(` would AND the trigrams of "void",
+"bool", and "run(" — wrongly requiring all three in every file. The fix was
+the AND/OR plan tree that mirrors the regexp AST. This was the single biggest
+correctness improvement: it went from "silently drops matches" to "zero false
+negatives verified against grep."
+
+**"这个 GitHub 的呢"** — Reading the
+[Blackbird writeup](https://github.blog/engineering/the-technology-behind-githubs-new-code-search/)
+introduced two ideas: boundary-biased sparse grams (still on the roadmap) and
+the general principle that index density matters. If your index is 80MB for
+16k files, something is wrong. This eventually led to varint delta encoding
+(55MB → 25MB, −55%).
+
+**"还有这个 ripgrep"** — Reading BurntSushi's
+[regex crate internals](https://github.com/burntsushi/ripgrep) revealed the
+Teddy SIMD algorithm and why ripgrep is so fast for literal search. Rather than
+compete with it, integrate it: the `--rg` flag pipes candidate paths to `rg`
+for SIMD-accelerated within-file verification. Use the index for what it's good
+at (narrowing 16k files to 100), use ripgrep for what it's good at (searching
+100 files in microseconds).
+
+**"先做 varint，再做最小 posting list 优先。其他记到 todo.md"** — Prioritization.
+Of all the remaining optimizations, varint had the biggest measurable impact
+(−55% index size) and smallest-first was free (O(k log k) sort, zero I/O cost).
+Everything else — boundary trigrams, bitset candidates, daemon mode — went to
+the backlog. Ship the high-ROI changes, defer the speculative ones.
+
+**Independent evaluation (Claude Opus, isolated context)** — The honest moment.
+Opus ran 101 tool calls across 9 test patterns and found:
+- Correctness: **A** — zero false negatives across all patterns including edge cases
+- The "96× speedup" claimed in the original README was **not reproducible** under
+  warm-cache conditions. Real number: 4× (13× with mmap). Fixed.
+- The bloom filter adds 42% to index size for typically <5% candidate reduction.
+  Verdict: over-engineered for the benefit. Kept it because the cost is acceptable
+  and it helps on longer phrases, but documented the tradeoff honestly.
+- Highest-ROI next step: daemon mode (eliminate 20ms Go startup + index load
+  per query). Deferred in favor of simpler mmap-default approach — good enough
+  for 2–50k file projects.
+
+**"默认开着？其实大部分项目也就 2-5 万以内"** — The decision to default `--mmap=true`
+instead of building a daemon. For the target scale (2–50k files), OS page cache
+keeps the 25MB index warm across invocations. Warm-cache latency: 7–13ms.
+No daemon process to manage, no socket to debug, no lifecycle to handle.
+The simplest solution that meets the performance bar.
+
+---
+
+These conversations illustrate a pattern: the best engineering doesn't come
+from the first implementation. It comes from the cycle of *build → measure →
+read what others did → understand why → rebuild*. Each reference (Cursor, zoekt,
+Blackbird, ripgrep) contributed a specific insight. Each measurement killed an
+assumption. The final product is 38KB of Go with zero dependencies, and every
+line earned its place.
