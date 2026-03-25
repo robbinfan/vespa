@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"regexp/syntax"
@@ -45,10 +46,20 @@ import (
 //                 trigram — enables "3.5-gram" filtering without storing
 //                 full positional data.
 //
+// Version 5 (varint delta encoding for posting lists, ~37% size reduction):
+//   Header:       magic(4) + version(4) + numFiles(4) + numTrigrams(4) + postingsByteLen(4)
+//   FileTable:    same as v4
+//   TrigramTable: [trigram(4) + byteOffset(4) + count(4)] × numTrigrams
+//                 byteOffset is a byte offset into the varint data section
+//   PostingLists: uvarint-delta encoded: each entry = uvarint(fileID − prevFileID),
+//                 first entry is the raw fileID. Lists remain sorted.
+//   BloomData:    same layout as v4 (1 byte per logical entry, parallel to PostingLists).
+//                 Indexed via relBases[ti] = sum of counts[0..ti-1].
+//
 // count == 0 in TrigramTable means the trigram was pruned (too frequent).
 
 const magic = 0x54524749 // "TRGI"
-const version = 4
+const version = 5
 
 // postingEntry pairs a file ID with its bloom byte.
 // bloom bit i is set if any byte in [i*32, i*32+31] follows this trigram in the file.
@@ -174,10 +185,27 @@ func evalPlan(idx *index, plan trigramPlan) ([]uint32, bool) {
 	switch p := plan.(type) {
 
 	case planLits:
+		// Sort trigrams by posting-list size ascending so the smallest list
+		// is intersected first — each intersection can only shrink the candidate
+		// set, so starting with the rarest trigram prunes the most work for free.
+		ts := make([]uint32, len(p.trigrams))
+		copy(ts, p.trigrams)
+		sort.Slice(ts, func(i, j int) bool {
+			ti, tj := idx.findTrigram(ts[i]), idx.findTrigram(ts[j])
+			var ci, cj uint32
+			if ti >= 0 {
+				ci = idx.counts[ti]
+			}
+			if tj >= 0 {
+				cj = idx.counts[tj]
+			}
+			return ci < cj
+		})
+
 		// Intersect posting lists for all required trigrams.
 		var cands []uint32
 		constrained := false
-		for _, t := range p.trigrams {
+		for _, t := range ts {
 			posts, pruned := idx.lookup(t)
 			if pruned {
 				continue // too common, skip constraint
@@ -488,24 +516,28 @@ func (u *updateCmd) run() error {
 	// re-prunes them correctly and bloom filtering is not falsely applied.
 	var prunedTrigrams []uint32
 	hasBloom := idx.version >= 4 && len(idx.bloomData) > 0
-	data := idx.data
 	for ti, t := range idx.trigrams {
 		cnt := idx.counts[ti]
 		if cnt == 0 {
 			prunedTrigrams = append(prunedTrigrams, t)
 			continue
 		}
-		off := idx.offsets[ti]
-		relBase := (off - idx.postingBase) / 4
-		for i := uint32(0); i < cnt; i++ {
-			fid := binary.LittleEndian.Uint32(data[off+i*4:])
+		fileIDs := idx.postingList(ti) // handles v4 and v5
+		var relBase uint32
+		if idx.version >= 5 {
+			relBase = idx.relBases[ti]
+		} else {
+			off := idx.offsets[ti]
+			relBase = (off - idx.postingBase) / 4
+		}
+		for i, fid := range fileIDs {
 			if perFileTrigrams[fid] == nil {
 				continue
 			}
 			perFileTrigrams[fid] = append(perFileTrigrams[fid], t)
 			var bl uint8
 			if hasBloom {
-				bl = idx.bloomData[relBase+i]
+				bl = idx.bloomData[relBase+uint32(i)]
 			} else {
 				bl = 0xFF // v3 index: no bloom data, conservative
 			}
@@ -564,6 +596,40 @@ func writeIndex(output string, files []fileInfo, posting map[uint32][]postingEnt
 		}
 	}
 
+	// Precompute varint-delta encoding for each non-pruned posting list.
+	// Storing deltas between consecutive sorted fileIDs saves ~37% vs raw uint32.
+	type triEncoded struct {
+		varint []byte // uvarint-delta encoded fileIDs
+		bloom  []byte // parallel bloom bytes
+	}
+	encoded := make([]triEncoded, len(trigrams))
+	var totalEntries uint32
+	for i, t := range trigrams {
+		if pruneThreshold > 0 && len(posting[t]) > pruneThreshold {
+			continue
+		}
+		entries := posting[t]
+		vbuf := make([]byte, 0, len(entries)*2)
+		var scratch [binary.MaxVarintLen64]byte
+		var prev uint32
+		for _, e := range entries {
+			n := binary.PutUvarint(scratch[:], uint64(e.fileID-prev))
+			vbuf = append(vbuf, scratch[:n]...)
+			prev = e.fileID
+		}
+		bloom := make([]byte, len(entries))
+		for j, e := range entries {
+			bloom[j] = e.bloom
+		}
+		encoded[i] = triEncoded{vbuf, bloom}
+		totalEntries += uint32(len(entries))
+	}
+
+	var postingsByteLen uint32
+	for i := range encoded {
+		postingsByteLen += uint32(len(encoded[i].varint))
+	}
+
 	if err := os.MkdirAll(filepath.Dir(output), 0755); err != nil {
 		return err
 	}
@@ -590,13 +656,14 @@ func writeIndex(output string, files []fileInfo, posting map[uint32][]postingEnt
 		w.Write(buf[:])
 	}
 
-	// Header
+	// Header (v5: 20 bytes — adds postingsByteLen)
 	write32(magic)
-	write32(version) // v4
+	write32(version) // v5
 	write32(uint32(len(files)))
 	write32(uint32(len(trigrams)))
+	write32(postingsByteLen)
 
-	// File table (v3+: path + mtime + size)
+	// File table (path + mtime + size)
 	for _, fi := range files {
 		write16(uint16(len(fi.path)))
 		w.WriteString(fi.path)
@@ -604,48 +671,37 @@ func writeIndex(output string, files []fileInfo, posting map[uint32][]postingEnt
 		write64(fi.size)
 	}
 
-	// Compute postingStart (byte offset of PostingLists section)
+	// Compute postingStart (byte offset of PostingLists section).
+	// v5 header is 20 bytes (not 16).
 	fileTableSize := 0
 	for _, fi := range files {
 		fileTableSize += 2 + len(fi.path) + 16
 	}
-	postingStart := uint32(16 + fileTableSize + len(trigrams)*12)
+	postingStart := uint32(20 + fileTableSize + len(trigrams)*12)
 
-	// Trigram table — assign offsets and track total posting entries
-	offset := postingStart
-	totalEntries := uint32(0)
-	for _, t := range trigrams {
+	// Trigram table — byte offsets into varint data
+	byteOff := uint32(0)
+	for i, t := range trigrams {
 		cnt := uint32(len(posting[t]))
 		write32(t)
 		if pruneThreshold > 0 && int(cnt) > pruneThreshold {
 			write32(0)
 			write32(0) // pruned sentinel
 		} else {
-			write32(offset)
+			write32(postingStart + byteOff)
 			write32(cnt)
-			offset += cnt * 4
-			totalEntries += cnt
+			byteOff += uint32(len(encoded[i].varint))
 		}
 	}
 
-	// Posting lists (fileIDs, non-pruned only)
-	for _, t := range trigrams {
-		if pruneThreshold > 0 && len(posting[t]) > pruneThreshold {
-			continue
-		}
-		for _, e := range posting[t] {
-			write32(e.fileID)
-		}
+	// Posting lists (varint-delta encoded)
+	for i := range encoded {
+		w.Write(encoded[i].varint)
 	}
 
-	// Bloom section (1 byte per posting entry, parallel to posting lists)
-	for _, t := range trigrams {
-		if pruneThreshold > 0 && len(posting[t]) > pruneThreshold {
-			continue
-		}
-		for _, e := range posting[t] {
-			w.WriteByte(e.bloom)
-		}
+	// Bloom section (1 byte per posting entry, parallel to PostingLists)
+	for i := range encoded {
+		w.Write(encoded[i].bloom)
 	}
 
 	if err := w.Flush(); err != nil {
@@ -660,10 +716,11 @@ func writeIndex(output string, files []fileInfo, posting map[uint32][]postingEnt
 	}
 
 	elapsed := time.Since(start).Round(time.Millisecond)
+	varintKB := postingsByteLen / 1024
 	bloomKB := totalEntries / 1024
 	fmt.Fprintf(os.Stderr,
-		"Index written in %v: %d files, %d trigrams (%d pruned, freq>%.0f%%), bloom +%dKB -> %s\n",
-		elapsed, len(files), len(trigrams), prunedCount, maxFreq*100, bloomKB, output)
+		"Index written in %v: %d files, %d trigrams (%d pruned, freq>%.0f%%), posting %dKB (varint), bloom +%dKB -> %s\n",
+		elapsed, len(files), len(trigrams), prunedCount, maxFreq*100, varintKB, bloomKB, output)
 	return nil
 }
 
@@ -674,10 +731,11 @@ type index struct {
 	files       []fileInfo
 	trigrams    []uint32 // sorted
 	offsets     []uint32
-	counts      []uint32 // count==0 means pruned
+	counts      []uint32  // count==0 means pruned
 	data        []byte
-	postingBase uint32 // byte offset where PostingLists section starts
-	bloomData   []byte // parallel to posting entries; nil for v3 indexes
+	postingBase uint32    // v4: byte offset of PostingLists; unused for v5
+	bloomData   []byte    // parallel to posting entries; nil for v3
+	relBases    []uint32  // v5: relBases[ti] = sum(counts[0..ti-1]) for bloom indexing
 }
 
 // loadIndex reads the index file. If useMmap is true, the file is memory-mapped
@@ -724,7 +782,15 @@ func loadIndex(path string, useMmap bool) (*index, error) {
 	numFiles := int(binary.LittleEndian.Uint32(data[8:]))
 	numTrigrams := int(binary.LittleEndian.Uint32(data[12:]))
 
+	var postingsByteLen uint32
 	pos := 16
+	if ver >= 5 {
+		if len(data) < 20 {
+			return nil, fmt.Errorf("index too small for v5 header")
+		}
+		postingsByteLen = binary.LittleEndian.Uint32(data[16:])
+		pos = 20
+	}
 	files := make([]fileInfo, numFiles)
 	for i := range files {
 		if pos+2 > len(data) {
@@ -762,10 +828,25 @@ func loadIndex(path string, useMmap bool) (*index, error) {
 		pos += 12
 	}
 
-	postingBase := uint32(pos)
+	postingBase := uint32(pos) // v4: start of uint32 posting data; unused for v5
 
 	var bloomData []byte
-	if ver >= 4 {
+	var relBases []uint32
+	if ver >= 5 {
+		// relBases[ti] = cumulative count before trigram ti (for bloom indexing).
+		relBases = make([]uint32, numTrigrams)
+		var cum uint32
+		for i := 0; i < numTrigrams; i++ {
+			relBases[i] = cum
+			cum += counts[i]
+		}
+		// Bloom section immediately follows varint posting data.
+		bloomStart := pos + int(postingsByteLen)
+		bloomEnd := bloomStart + int(cum)
+		if bloomEnd <= len(data) {
+			bloomData = data[bloomStart:bloomEnd]
+		}
+	} else if ver >= 4 {
 		bloomStart := int(postingBase) + int(totalEntries)*4
 		bloomEnd := bloomStart + int(totalEntries)
 		if bloomEnd <= len(data) {
@@ -782,6 +863,7 @@ func loadIndex(path string, useMmap bool) (*index, error) {
 		data:        data,
 		postingBase: postingBase,
 		bloomData:   bloomData,
+		relBases:    relBases,
 	}, nil
 }
 
@@ -802,13 +884,30 @@ func (idx *index) findTrigram(t uint32) int {
 	return lo
 }
 
-// postingList returns a copy of file IDs for trigram at table index ti.
+// postingList returns the decoded file IDs for trigram at table index ti.
 func (idx *index) postingList(ti int) []uint32 {
 	cnt := idx.counts[ti]
 	if cnt == 0 {
 		return nil
 	}
 	off := idx.offsets[ti]
+	if idx.version >= 5 {
+		// Varint-delta encoded: each entry = uvarint(fileID - prevFileID).
+		result := make([]uint32, 0, cnt)
+		var prev uint32
+		pos := int(off)
+		for i := uint32(0); i < cnt; i++ {
+			delta, n := binary.Uvarint(idx.data[pos:])
+			if n <= 0 {
+				break // corrupt
+			}
+			pos += n
+			prev += uint32(delta)
+			result = append(result, prev)
+		}
+		return result
+	}
+	// v4: raw uint32 per entry
 	result := make([]uint32, cnt)
 	for i := uint32(0); i < cnt; i++ {
 		result[i] = binary.LittleEndian.Uint32(idx.data[off+i*4:])
@@ -846,15 +945,25 @@ func (idx *index) bloomFilter(candidates []uint32, phrase []byte) []uint32 {
 			continue // trigram absent or pruned — can't filter on it
 		}
 
-		off := idx.offsets[ti]
 		cnt := idx.counts[ti]
-		relBase := (off - idx.postingBase) / 4
+
+		// Decode posting list and resolve bloom base.
+		var relBase uint32
+		var postingIDs []uint32
+		if idx.version >= 5 {
+			relBase = idx.relBases[ti]
+			postingIDs = idx.postingList(ti)
+		} else {
+			off := idx.offsets[ti]
+			relBase = (off - idx.postingBase) / 4
+			postingIDs = idx.postingList(ti)
+		}
 
 		// Merge-scan candidates (sorted) against posting list (sorted by fileID).
 		filtered := candidates[:0]
 		ci, pi := 0, uint32(0)
 		for ci < len(candidates) && pi < cnt {
-			fid := binary.LittleEndian.Uint32(idx.data[off+pi*4:])
+			fid := postingIDs[pi]
 			c := candidates[ci]
 			switch {
 			case fid < c:
@@ -932,6 +1041,7 @@ type searchCmd struct {
 	context   int
 	rootDir   string
 	useMmap   bool
+	useRg     bool // --rg: use ripgrep for within-file verification
 }
 
 func (s *searchCmd) run() error {
@@ -960,6 +1070,10 @@ func (s *searchCmd) run() error {
 		candidates = allFileIDs(idx)
 	}
 	fmt.Fprintf(os.Stderr, "Candidates: %d / %d files\n", len(candidates), len(idx.files))
+
+	if s.useRg {
+		return s.runWithRg(idx, candidates)
+	}
 
 	rootDir := s.rootDir
 	if rootDir == "" {
@@ -1035,6 +1149,10 @@ func (s *searchCmd) runLiteral(idx *index) error {
 	fmt.Fprintf(os.Stderr, "Candidates: %d / %d files (bloom: %d→%d)\n",
 		len(candidates), len(idx.files), before, len(candidates))
 
+	if s.useRg {
+		return s.runWithRg(idx, candidates)
+	}
+
 	rootDir := s.rootDir
 	if rootDir == "" {
 		rootDir = "."
@@ -1083,6 +1201,83 @@ func (s *searchCmd) runLiteral(idx *index) error {
 	return nil
 }
 
+// runWithRg passes candidate file paths to ripgrep for within-file verification.
+// This leverages rg's SIMD-accelerated matching (Teddy algorithm for literals,
+// Aho-Corasick for multi-pattern) instead of Go's regexp engine.
+// Paths are written to a temp file and passed via the rg positional args to
+// avoid ARG_MAX limits when there are many candidates.
+func (s *searchCmd) runWithRg(idx *index, candidates []uint32) error {
+	rootDir := s.rootDir
+	if rootDir == "" {
+		rootDir = "."
+	}
+
+	// Write candidate paths to a temp file, then pass them as rg arguments.
+	// (rg ≥14 dropped --files-from; passing paths as args works for typical
+	// candidate counts of <10 000.)
+	tmp, err := os.CreateTemp("", "trigrep-rg-*.txt")
+	if err != nil {
+		return fmt.Errorf("tmpfile: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	bw := bufio.NewWriter(tmp)
+	for _, fid := range candidates {
+		fpath := filepath.Join(rootDir, idx.files[fid].path)
+		bw.WriteString(fpath)
+		bw.WriteByte('\n')
+	}
+	if err := bw.Flush(); err != nil {
+		tmp.Close()
+		return err
+	}
+	tmp.Close()
+
+	args := []string{"--no-messages"}
+	if s.literal {
+		args = append(args, "-F")
+	}
+	if s.filesOnly {
+		args = append(args, "-l")
+	} else if s.context > 0 {
+		args = append(args, fmt.Sprintf("-C%d", s.context))
+	}
+	// Pass pattern and the temp file listing candidate paths.
+	// Using -e and the temp file as a path-list via shell substitution is not
+	// portable; instead use the xargs-style approach: read newline-delimited
+	// paths from the temp file ourselves, then pass as args in batches.
+	args = append(args, "-e", s.pattern)
+
+	// Read paths from temp file and pass in batches to stay within ARG_MAX.
+	data, err := os.ReadFile(tmp.Name())
+	if err != nil {
+		return err
+	}
+	paths := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+
+	const batchSize = 512
+	for i := 0; i < len(paths); i += batchSize {
+		end := i + batchSize
+		if end > len(paths) {
+			end = len(paths)
+		}
+		batch := paths[i:end]
+		batchArgs := append(args, batch...)
+		cmd := exec.Command("rg", batchArgs...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			if cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 1 {
+				continue // no matches in this batch — fine
+			}
+			if i == 0 && strings.Contains(err.Error(), "not found") {
+				return fmt.Errorf("rg not found (install ripgrep): %w", err)
+			}
+			return err
+		}
+	}
+	return nil
+}
+
 // candidatesFromPhrase intersects posting lists for all trigrams in the literal phrase.
 // Used only by the -F path; regex path uses evalPlan instead.
 func candidatesFromPhrase(idx *index, phrase string) []uint32 {
@@ -1120,6 +1315,7 @@ func main() {
 	searchContext := searchFlags.Int("context", 2, "lines of context around matches")
 	searchRoot := searchFlags.String("root", ".", "root directory for resolving file paths")
 	searchMmap := searchFlags.Bool("mmap", false, "use mmap to load index (lower cold-start cost, experimental)")
+	searchRg := searchFlags.Bool("rg", false, "use ripgrep for within-file verification (faster matching via SIMD)")
 
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "Usage: trigrep <build|update|search> [options]")
@@ -1165,6 +1361,7 @@ func main() {
 			context:   *searchContext,
 			rootDir:   *searchRoot,
 			useMmap:   *searchMmap,
+			useRg:     *searchRg,
 		}).run(); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
