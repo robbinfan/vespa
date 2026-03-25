@@ -1215,7 +1215,7 @@ func (s *searchCmd) runWithRg(idx *index, candidates []uint32) error {
 	// Write candidate paths to a temp file, then pass them as rg arguments.
 	// (rg ≥14 dropped --files-from; passing paths as args works for typical
 	// candidate counts of <10 000.)
-	tmp, err := os.CreateTemp("", "trigrep-rg-*.txt")
+	tmp, err := os.CreateTemp("", "trex-rg-*.txt")
 	if err != nil {
 		return fmt.Errorf("tmpfile: %w", err)
 	}
@@ -1318,7 +1318,7 @@ func main() {
 	searchRg := searchFlags.Bool("rg", false, "use ripgrep for within-file verification (faster matching via SIMD)")
 
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "Usage: trigrep <build|update|search> [options]")
+		fmt.Fprintln(os.Stderr, "Usage: trex <build|update|search> [options]")
 		os.Exit(1)
 	}
 
