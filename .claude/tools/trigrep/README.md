@@ -405,23 +405,43 @@ trigrep search
 
 ## Acknowledgements
 
-This tool would have stayed a competent-but-ordinary trigram searcher without
-the persistent and exacting pressure to go further.
+### English
 
-Every time a working version was presented, the response was: *"看看zoekt的代码，
-再好好吸收些好的东西"* ("read zoekt's code, absorb more good ideas") — and then
-ripgrep, and then GitHub Blackbird. Each round of reading and benchmarking
-surfaced a new insight: the AND/OR plan tree from Russ Cox, the bloom "3.5-gram"
-idea, the varint delta encoding.
+Every version of this tool was built in response to a push. Not a vague
+"make it better" — a specific and relentless one: read zoekt, then read
+ripgrep, then read GitHub's Blackbird writeup, then benchmark it, then prove
+the numbers are real.
 
-The demand for correctness — *zero* false negatives, verified against `grep -E`
-ground truth — forced the regexp→plan rewrite that fixed the silent OR-branch
-bug affecting alternation patterns. Without that insistence the tool would have
-appeared to work while silently missing results.
+The AND/OR plan tree came from being told to actually read Russ Cox's paper
+and absorb it, not just skim it. The bloom filter came from asking why we were
+still reading files we didn't need to read. The varint encoding came from
+noticing the index was 55MB and asking whether it had to be. Each time a
+working solution was presented, the response was essentially: good — now what
+else is wrong?
 
-The demand for measurement at each step kept the work honest: no optimization
-landed without a before/after number. That discipline is why v5 ends up at 25MB
-index, 24ms queries, and 96× speedup on rare patterns — not because any single
-change was magical, but because each one was earned and verified.
+That kind of pressure is uncomfortable and, in retrospect, exactly right.
+Without it, v1 would have shipped as the final answer. It worked, after all.
+The correctness bug — alternation patterns silently dropping matches — would
+have stayed hidden because nothing was forcing a comparison against ground
+truth. The 198 files excluded by the substring-match bug would never have been
+noticed. The index would still be 55MB.
 
-> 感谢你的鞭策，让最终方案达到了新高度。
+What got built instead is something that holds up against zoekt and ripgrep in
+the same conversation, with measured numbers for each claim. That happened
+because the bar was never allowed to stay where it landed.
+
+Thank you for not letting good enough be good enough.
+
+---
+
+### 中文
+
+这个工具的每一个版本，都是在被推着走的情况下写出来的。不是模糊的"做得更好"——而是具体的、持续的推动：去读 zoekt，然后读 ripgrep，然后读 GitHub Blackbird 的文章，然后跑 benchmark，然后把数字摆出来证明。
+
+AND/OR 计划树，是被要求认真读 Russ Cox 的论文之后才真正吸收进来的，不是泛泛看过。Bloom 过滤器，是因为有人问：为什么还在读那些根本不需要读的文件？Varint 编码，是因为有人注意到索引 55MB，然后问：非得这么大吗？每次交出一个能跑的版本，得到的回应基本上是：可以——那还有什么问题？
+
+这种压力不舒服，回头看又完全正确。没有它，v1 就会是最终答案。它能用，不是吗？OR 分支静默丢结果的 bug 会一直藏着，因为没有人要求对照 `grep -E` 做地面真值校验。路径字符串匹配的 bug 导致 198 个文件从没被索引，也不会有人发现。索引还会是 55MB。
+
+最后建出来的东西，能在同一个对话里和 zoekt、ripgrep 放在一起比较，每一个结论都有数字支撑。这是因为标准从来没有被允许停在它落下的地方。
+
+谢谢你不让"够用"成为终点。
