@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -611,6 +612,7 @@ func intersect(a, b []uint32) []uint32 {
 type searchCmd struct {
 	indexPath string
 	pattern   string
+	literal   bool // -F: treat pattern as fixed string, not regex
 	filesOnly bool
 	context   int
 	rootDir   string
@@ -622,73 +624,20 @@ func (s *searchCmd) run() error {
 		return fmt.Errorf("loading index: %w", err)
 	}
 
+	// In literal (-F) mode the pattern is a plain substring, not a regex.
+	// We use all its trigrams directly (no metachar escaping needed) and
+	// verify with bytes.Contains instead of regexp — this is "phrase aware":
+	// the full phrase including punctuation like () contributes to filtering.
+	if s.literal {
+		return s.runLiteral(idx)
+	}
+
 	re, err := regexp.Compile(s.pattern)
 	if err != nil {
 		return fmt.Errorf("invalid pattern: %w", err)
 	}
 
-	literals := extractLiterals(s.pattern)
-
-	var candidates []uint32
-	if len(literals) == 0 {
-		candidates = make([]uint32, len(idx.files))
-		for i := range candidates {
-			candidates[i] = uint32(i)
-		}
-	} else {
-		for li, lit := range literals {
-			ts := extractTrigrams(lit)
-			if len(ts) == 0 {
-				continue
-			}
-
-			var litCandidates []uint32
-			initialized := false
-			allPruned := true
-
-			for _, t := range ts {
-				posts, pruned := idx.lookup(t)
-				if pruned {
-					continue
-				}
-				allPruned = false
-				if posts == nil {
-					litCandidates = nil
-					initialized = true
-					break
-				}
-				if !initialized {
-					litCandidates = posts
-					initialized = true
-				} else {
-					litCandidates = intersect(litCandidates, posts)
-				}
-				if len(litCandidates) == 0 {
-					break
-				}
-			}
-
-			if allPruned {
-				continue
-			}
-
-			if li == 0 || candidates == nil {
-				candidates = litCandidates
-			} else {
-				candidates = intersect(candidates, litCandidates)
-			}
-			if len(candidates) == 0 {
-				break
-			}
-		}
-
-		if candidates == nil {
-			candidates = make([]uint32, len(idx.files))
-			for i := range candidates {
-				candidates[i] = uint32(i)
-			}
-		}
-	}
+	candidates := s.candidatesFromLiterals(idx, extractLiterals(s.pattern))
 
 	fmt.Fprintf(os.Stderr, "Candidates: %d / %d files\n", len(candidates), len(idx.files))
 
@@ -752,6 +701,131 @@ func (s *searchCmd) run() error {
 	return nil
 }
 
+// runLiteral handles -F (fixed string) search.
+// Phrase-aware: uses ALL trigrams of the literal phrase for pre-filtering,
+// then verifies with bytes.Contains — no regex metacharacter ambiguity.
+func (s *searchCmd) runLiteral(idx *index) error {
+	needle := []byte(s.pattern)
+
+	// Use all trigrams of the full phrase as a single filter.
+	// Unlike regex mode, '(' ')' '.' etc. are part of the phrase and contribute
+	// their boundary trigrams (e.g. "un(" "n()") — much more selective.
+	candidates := s.candidatesFromLiterals(idx, []string{s.pattern})
+
+	fmt.Fprintf(os.Stderr, "Candidates: %d / %d files\n", len(candidates), len(idx.files))
+
+	rootDir := s.rootDir
+	if rootDir == "" {
+		rootDir = "."
+	}
+
+	for _, fid := range candidates {
+		fpath := filepath.Join(rootDir, idx.files[fid].path)
+		content, err := os.ReadFile(fpath)
+		if err != nil {
+			continue
+		}
+
+		if s.filesOnly {
+			if bytes.Contains(content, needle) {
+				fmt.Println(idx.files[fid].path)
+			}
+		} else {
+			lines := strings.Split(string(content), "\n")
+			printed := false
+			for lineNo, line := range lines {
+				if strings.Contains(line, s.pattern) {
+					if !printed {
+						fmt.Printf("\n%s\n", idx.files[fid].path)
+						printed = true
+					}
+					start := lineNo - s.context
+					if start < 0 {
+						start = 0
+					}
+					end := lineNo + s.context + 1
+					if end > len(lines) {
+						end = len(lines)
+					}
+					for i := start; i < end; i++ {
+						if i == lineNo {
+							fmt.Printf("%d: %s\n", i+1, lines[i])
+						} else {
+							fmt.Printf("%d- %s\n", i+1, lines[i])
+						}
+					}
+					fmt.Println("--")
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// candidatesFromLiterals intersects posting lists for trigrams derived from
+// the given literal strings. Returns all file IDs if no usable trigrams exist.
+func (s *searchCmd) candidatesFromLiterals(idx *index, literals []string) []uint32 {
+	allFiles := func() []uint32 {
+		c := make([]uint32, len(idx.files))
+		for i := range c {
+			c[i] = uint32(i)
+		}
+		return c
+	}
+
+	var candidates []uint32
+	for li, lit := range literals {
+		ts := extractTrigrams(lit)
+		if len(ts) == 0 {
+			continue
+		}
+
+		var litCandidates []uint32
+		initialized := false
+		allPruned := true
+
+		for _, t := range ts {
+			posts, pruned := idx.lookup(t)
+			if pruned {
+				continue
+			}
+			allPruned = false
+			if posts == nil {
+				litCandidates = nil
+				initialized = true
+				break
+			}
+			if !initialized {
+				litCandidates = posts
+				initialized = true
+			} else {
+				litCandidates = intersect(litCandidates, posts)
+			}
+			if len(litCandidates) == 0 {
+				break
+			}
+		}
+
+		if allPruned {
+			continue
+		}
+
+		if li == 0 || candidates == nil {
+			candidates = litCandidates
+		} else {
+			candidates = intersect(candidates, litCandidates)
+		}
+		if len(candidates) == 0 {
+			break
+		}
+	}
+
+	if candidates == nil {
+		return allFiles()
+	}
+	return candidates
+}
+
 // ---- main ------------------------------------------------------------------
 
 func main() {
@@ -771,7 +845,9 @@ func main() {
 
 	searchFlags := flag.NewFlagSet("search", flag.ExitOnError)
 	searchIndex := searchFlags.String("index", ".claude/trigram-index.bin", "index file")
-	searchPattern := searchFlags.String("pattern", "", "regex pattern")
+	searchPattern := searchFlags.String("pattern", "", "regex pattern (or literal with -F)")
+	searchLiteral := searchFlags.Bool("literal", false, "treat pattern as fixed string, not regex (-F shorthand also accepted)")
+	searchFlags.BoolVar(searchLiteral, "F", false, "shorthand for --literal")
 	searchFilesOnly := searchFlags.Bool("files-only", false, "only print matching file paths")
 	searchContext := searchFlags.Int("context", 2, "lines of context")
 	searchRoot := searchFlags.String("root", ".", "root directory for resolving file paths")
@@ -817,6 +893,7 @@ func main() {
 		cmd := &searchCmd{
 			indexPath: *searchIndex,
 			pattern:   *searchPattern,
+			literal:   *searchLiteral,
 			filesOnly: *searchFilesOnly,
 			context:   *searchContext,
 			rootDir:   *searchRoot,
