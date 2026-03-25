@@ -17,11 +17,12 @@ import (
 // Index format (binary):
 // Header: magic(4) + version(4) + numFiles(4) + numTrigrams(4)
 // FileTable: for each file: pathLen(2) + path bytes
-// TrigramTable: sorted array of [trigram(3) + pad(1) + offset(4) + count(4)] = 12 bytes each
+// TrigramTable: sorted array of [trigram(4) + offset(4) + count(4)] = 12 bytes each
+//   count == 0 means the trigram was pruned (too frequent to be useful for filtering)
 // PostingLists: arrays of uint32 file IDs
 
 const magic = 0x54524749 // "TRGI"
-const version = 1
+const version = 2
 
 func extractTrigrams(s string) []uint32 {
 	seen := make(map[uint32]bool)
@@ -100,10 +101,11 @@ func extractLiterals(pattern string) []string {
 }
 
 type buildCmd struct {
-	dir    string
-	output string
-	exts   string
-	ignore string
+	dir      string
+	output   string
+	exts     string
+	ignore   string
+	maxFreq  float64 // prune trigrams appearing in > maxFreq fraction of files (0 = no pruning)
 }
 
 func (b *buildCmd) run() error {
@@ -186,12 +188,28 @@ func (b *buildCmd) run() error {
 		}
 	}
 
+	// Compute prune threshold
+	pruneThreshold := 0
+	if b.maxFreq > 0 && b.maxFreq < 1.0 {
+		pruneThreshold = int(b.maxFreq * float64(len(files)))
+	}
+
 	// Sort trigrams for binary search
 	trigrams := make([]uint32, 0, len(posting))
 	for t := range posting {
 		trigrams = append(trigrams, t)
 	}
 	sort.Slice(trigrams, func(i, j int) bool { return trigrams[i] < trigrams[j] })
+
+	// Count pruned trigrams
+	prunedCount := 0
+	if pruneThreshold > 0 {
+		for _, t := range trigrams {
+			if len(posting[t]) > pruneThreshold {
+				prunedCount++
+			}
+		}
+	}
 
 	// Write index
 	if err := os.MkdirAll(filepath.Dir(b.output), 0755); err != nil {
@@ -228,8 +246,7 @@ func (b *buildCmd) run() error {
 		w.WriteString(rel)
 	}
 
-	// Calculate posting list offsets
-	// Each trigram entry: trigram(4) + offset(4) + count(4) = 12 bytes
+	// Calculate posting list offsets (pruned trigrams have count=0, no posting data)
 	headerSize := 4 * 4 // 4 uint32s
 	fileTableSize := 0
 	for _, fpath := range files {
@@ -242,14 +259,24 @@ func (b *buildCmd) run() error {
 	// Trigram table
 	offset := postingStart
 	for _, t := range trigrams {
+		cnt := uint32(len(posting[t]))
 		write32(t)
-		write32(offset)
-		write32(uint32(len(posting[t])))
-		offset += uint32(len(posting[t])) * 4
+		if pruneThreshold > 0 && int(cnt) > pruneThreshold {
+			// Pruned: stored with count=0 and offset=0 as sentinel
+			write32(0) // offset (unused)
+			write32(0) // count = 0 signals "pruned"
+		} else {
+			write32(offset)
+			write32(cnt)
+			offset += cnt * 4
+		}
 	}
 
-	// Posting lists
+	// Posting lists (only for non-pruned trigrams)
 	for _, t := range trigrams {
+		if pruneThreshold > 0 && len(posting[t]) > pruneThreshold {
+			continue // pruned
+		}
 		for _, fid := range posting[t] {
 			write32(fid)
 		}
@@ -259,8 +286,16 @@ func (b *buildCmd) run() error {
 		return err
 	}
 
-	fmt.Fprintf(os.Stderr, "Index built in %v: %d files, %d unique trigrams -> %s\n",
-		time.Since(start).Round(time.Millisecond), len(files), len(trigrams), b.output)
+	elapsed := time.Since(start).Round(time.Millisecond)
+	if pruneThreshold > 0 {
+		fmt.Fprintf(os.Stderr,
+			"Index built in %v: %d files, %d trigrams (%d pruned, freq>%.0f%%) -> %s\n",
+			elapsed, len(files), len(trigrams), prunedCount, b.maxFreq*100, b.output)
+	} else {
+		fmt.Fprintf(os.Stderr,
+			"Index built in %v: %d files, %d unique trigrams -> %s\n",
+			elapsed, len(files), len(trigrams), b.output)
+	}
 	return nil
 }
 
@@ -268,7 +303,7 @@ type index struct {
 	files    []string
 	trigrams []uint32 // sorted
 	offsets  []uint32
-	counts   []uint32
+	counts   []uint32 // count==0 means pruned (too frequent)
 	data     []byte
 }
 
@@ -318,7 +353,9 @@ func loadIndex(path string) (*index, error) {
 	return &index{files: files, trigrams: trigrams, offsets: offsets, counts: counts, data: data}, nil
 }
 
-func (idx *index) lookup(t uint32) []uint32 {
+// lookup returns the posting list for trigram t.
+// Returns (list, false) on hit, (nil, true) if pruned, (nil, false) if not found.
+func (idx *index) lookup(t uint32) ([]uint32, bool) {
 	lo, hi := 0, len(idx.trigrams)
 	for lo < hi {
 		mid := (lo + hi) / 2
@@ -329,15 +366,18 @@ func (idx *index) lookup(t uint32) []uint32 {
 		}
 	}
 	if lo >= len(idx.trigrams) || idx.trigrams[lo] != t {
-		return nil
+		return nil, false // not found
+	}
+	cnt := idx.counts[lo]
+	if cnt == 0 {
+		return nil, true // pruned sentinel
 	}
 	off := idx.offsets[lo]
-	cnt := idx.counts[lo]
 	result := make([]uint32, cnt)
 	for i := uint32(0); i < cnt; i++ {
 		result[i] = binary.LittleEndian.Uint32(idx.data[off+i*4:])
 	}
-	return result
+	return result, false
 }
 
 func intersect(a, b []uint32) []uint32 {
@@ -387,20 +427,34 @@ func (s *searchCmd) run() error {
 			candidates[i] = uint32(i)
 		}
 	} else {
-		// For each literal, get its trigrams and intersect
-		// Between literals we intersect (all required)
-		// Within a literal, all its trigrams are required (AND)
+		// For each literal, intersect its trigrams.
+		// Pruned trigrams (too frequent) are skipped.
+		// If ALL trigrams for a literal are pruned, that literal can't filter → skip it.
 		for li, lit := range literals {
 			ts := extractTrigrams(lit)
 			if len(ts) == 0 {
 				continue
 			}
-			// Intersect all trigrams within this literal
+
 			var litCandidates []uint32
-			for ti, t := range ts {
-				posts := idx.lookup(t)
-				if ti == 0 {
+			initialized := false
+			allPruned := true
+
+			for _, t := range ts {
+				posts, pruned := idx.lookup(t)
+				if pruned {
+					continue // skip this trigram, it matches too many files to be useful
+				}
+				allPruned = false
+				if posts == nil {
+					// Trigram genuinely absent → literal can't exist → no candidates
+					litCandidates = nil
+					initialized = true
+					break
+				}
+				if !initialized {
 					litCandidates = posts
+					initialized = true
 				} else {
 					litCandidates = intersect(litCandidates, posts)
 				}
@@ -408,14 +462,28 @@ func (s *searchCmd) run() error {
 					break
 				}
 			}
+
+			if allPruned {
+				// Can't filter by this literal at all
+				continue
+			}
+
 			// Intersect across literals
-			if li == 0 {
+			if li == 0 || candidates == nil {
 				candidates = litCandidates
 			} else {
 				candidates = intersect(candidates, litCandidates)
 			}
 			if len(candidates) == 0 {
 				break
+			}
+		}
+
+		// If all literals were fully pruned, fall back to full scan
+		if candidates == nil {
+			candidates = make([]uint32, len(idx.files))
+			for i := range candidates {
+				candidates[i] = uint32(i)
 			}
 		}
 	}
@@ -491,6 +559,7 @@ func main() {
 	buildOutput := buildFlags.String("output", ".claude/trigram-index.bin", "output index file")
 	buildExts := buildFlags.String("ext", "cpp,h,java,py,go,rs,ts,js,c,cc,hpp,hh", "file extensions to index")
 	buildIgnore := buildFlags.String("ignore", "vendor,node_modules,target,build", "directory patterns to ignore")
+	buildMaxFreq := buildFlags.Float64("max-freq", 0.5, "prune trigrams appearing in more than this fraction of files (0=disabled)")
 
 	searchFlags := flag.NewFlagSet("search", flag.ExitOnError)
 	searchIndex := searchFlags.String("index", ".claude/trigram-index.bin", "index file")
@@ -507,7 +576,13 @@ func main() {
 	switch os.Args[1] {
 	case "build":
 		buildFlags.Parse(os.Args[2:])
-		cmd := &buildCmd{dir: *buildDir, output: *buildOutput, exts: *buildExts, ignore: *buildIgnore}
+		cmd := &buildCmd{
+			dir:     *buildDir,
+			output:  *buildOutput,
+			exts:    *buildExts,
+			ignore:  *buildIgnore,
+			maxFreq: *buildMaxFreq,
+		}
 		if err := cmd.run(); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
 			os.Exit(1)
