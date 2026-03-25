@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"regexp/syntax"
 	"runtime"
 	"sort"
 	"strings"
@@ -72,62 +73,174 @@ func extractTrigrams(s string) []uint32 {
 	return result
 }
 
-// extractLiterals pulls required literal substrings from a regex pattern.
-// Returns up to 3 of the longest runs so we can derive their trigrams.
-func extractLiterals(pattern string) []string {
-	var literals []string
-	var current strings.Builder
-	escaped := false
-	inClass := false
+// ---- regexp → trigram plan -------------------------------------------------
+//
+// Instead of extracting flat literal substrings (which incorrectly ANDs all
+// literals together), we build an AND/OR tree that mirrors the regexp structure:
+//
+//   Literal  →  planLits (all trigrams required)
+//   Concat   →  planAnd  (all children required)
+//   Alternate→  planOr   (at least one child required)
+//   Plus     →  same as child (at least one occurrence)
+//   Star/Quest/CharClass/Dot → nil (unconstrained)
+//
+// Example: "(void|bool).*run\(" → And[Or[lits("void"), lits("bool")], lits("run(")]
+// This correctly unions "void" and "bool" candidates before intersecting with "run(".
+// The old extractLiterals approach would AND all three, wrongly excluding
+// files that have "void run(" but not "bool".
 
-	flush := func() {
-		s := current.String()
-		if len(s) >= 3 {
-			literals = append(literals, s)
-		}
-		current.Reset()
-	}
+type trigramPlan interface{ isTrigram() }
 
-	for i := 0; i < len(pattern); i++ {
-		c := pattern[i]
-		if escaped {
-			escaped = false
-			switch c {
-			case 'd', 'w', 's', 'D', 'W', 'S', 'b', 'B', 'n', 't', 'r':
-				flush()
-			default:
-				current.WriteByte(c)
+type planAnd  struct{ children []trigramPlan }
+type planOr   struct{ children []trigramPlan }
+type planLits struct{ trigrams []uint32 }
+
+func (planAnd)  isTrigram() {}
+func (planOr)   isTrigram() {}
+func (planLits) isTrigram() {}
+
+// regexpToPlan converts a parsed regexp to a trigramPlan.
+// nil means "no constraint" (might match all files).
+func regexpToPlan(re *syntax.Regexp) trigramPlan {
+	switch re.Op {
+	case syntax.OpLiteral:
+		if re.Flags&syntax.FoldCase != 0 {
+			// Case-insensitive literal: any case variant may appear in the file.
+			// Since the index is case-sensitive we can't constrain — be conservative.
+			return nil
+		}
+		b := []byte(string(re.Rune))
+		ts := extractTrigrams(string(b))
+		if len(ts) == 0 {
+			return nil
+		}
+		return planLits{ts}
+
+	case syntax.OpConcat:
+		var children []trigramPlan
+		for _, sub := range re.Sub {
+			if p := regexpToPlan(sub); p != nil {
+				children = append(children, p)
 			}
-			continue
 		}
-		if c == '\\' {
-			escaped = true
-			continue
-		}
-		if inClass {
-			if c == ']' {
-				inClass = false
-				flush()
-			}
-			continue
-		}
-		switch c {
-		case '[':
-			flush()
-			inClass = true
-		case '.', '*', '+', '?', '(', ')', '|', '^', '$', '{', '}':
-			flush()
+		switch len(children) {
+		case 0:
+			return nil
+		case 1:
+			return children[0]
 		default:
-			current.WriteByte(c)
+			return planAnd{children}
 		}
-	}
-	flush()
 
-	sort.Slice(literals, func(i, j int) bool { return len(literals[i]) > len(literals[j]) })
-	if len(literals) > 3 {
-		literals = literals[:3]
+	case syntax.OpAlternate:
+		children := make([]trigramPlan, 0, len(re.Sub))
+		for _, sub := range re.Sub {
+			p := regexpToPlan(sub)
+			if p == nil {
+				// One branch unconstrained → whole OR is unconstrained.
+				return nil
+			}
+			children = append(children, p)
+		}
+		switch len(children) {
+		case 0:
+			return nil
+		case 1:
+			return children[0]
+		default:
+			return planOr{children}
+		}
+
+	case syntax.OpCapture:
+		return regexpToPlan(re.Sub[0])
+
+	case syntax.OpPlus:
+		// At least one occurrence: child's constraint applies.
+		return regexpToPlan(re.Sub[0])
+
+	default:
+		// OpStar, OpQuest, OpRepeat with min=0, OpDot, OpCharClass, etc.
+		// May match zero times or arbitrary chars: no trigram constraint.
+		return nil
 	}
-	return literals
+}
+
+// evalPlan evaluates a trigramPlan against the index.
+// Returns (candidates, unconstrained). If unconstrained is true, all files qualify.
+func evalPlan(idx *index, plan trigramPlan) ([]uint32, bool) {
+	if plan == nil {
+		return nil, true
+	}
+	switch p := plan.(type) {
+
+	case planLits:
+		// Intersect posting lists for all required trigrams.
+		var cands []uint32
+		constrained := false
+		for _, t := range p.trigrams {
+			posts, pruned := idx.lookup(t)
+			if pruned {
+				continue // too common, skip constraint
+			}
+			if posts == nil {
+				return nil, false // trigram absent → impossible
+			}
+			if !constrained {
+				cands = posts
+				constrained = true
+			} else {
+				cands = intersect(cands, posts)
+				if len(cands) == 0 {
+					return nil, false
+				}
+			}
+		}
+		if !constrained {
+			return nil, true // all trigrams pruned
+		}
+		return cands, false
+
+	case planAnd:
+		var cands []uint32
+		constrained := false
+		for _, child := range p.children {
+			childCands, childFree := evalPlan(idx, child)
+			if childFree {
+				continue
+			}
+			if childCands == nil {
+				return nil, false
+			}
+			if !constrained {
+				cands = childCands
+				constrained = true
+			} else {
+				cands = intersect(cands, childCands)
+				if len(cands) == 0 {
+					return nil, false
+				}
+			}
+		}
+		if !constrained {
+			return nil, true
+		}
+		return cands, false
+
+	case planOr:
+		var cands []uint32
+		for _, child := range p.children {
+			childCands, childFree := evalPlan(idx, child)
+			if childFree {
+				return nil, true // one branch unconstrained → all files
+			}
+			if childCands == nil {
+				continue // this branch matches nothing
+			}
+			cands = union(cands, childCands)
+		}
+		return cands, len(cands) == 0 // empty OR result → either impossible or all pruned
+	}
+	return nil, true
 }
 
 // ---- file collection -------------------------------------------------------
@@ -136,6 +249,20 @@ type fileInfo struct {
 	path  string
 	mtime int64
 	size  int64
+}
+
+// hasIgnoredComponent reports whether any slash-separated component of path
+// exactly matches one of the ignore patterns. This prevents false matches like
+// "target" matching "summarycompacttarget.cpp".
+func hasIgnoredComponent(path string, ignoreSet []string) bool {
+	for _, part := range strings.Split(filepath.ToSlash(path), "/") {
+		for _, ig := range ignoreSet {
+			if ig != "" && part == ig {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func collectFiles(dir, exts, ignore string) ([]fileInfo, error) {
@@ -161,20 +288,13 @@ func collectFiles(dir, exts, ignore string) ([]fileInfo, error) {
 			if name == ".git" || name == ".claude" {
 				return filepath.SkipDir
 			}
-			for _, ig := range ignoreSet {
-				if ig != "" && strings.Contains(path, ig) {
-					return filepath.SkipDir
-				}
+			if hasIgnoredComponent(path, ignoreSet) {
+				return filepath.SkipDir
 			}
 			return nil
 		}
 		if len(extSet) > 0 && !extSet[filepath.Ext(path)] {
 			return nil
-		}
-		for _, ig := range ignoreSet {
-			if ig != "" && strings.Contains(path, ig) {
-				return nil
-			}
 		}
 		rel, err := filepath.Rel(dir, path)
 		if err != nil {
@@ -776,6 +896,32 @@ func intersect(a, b []uint32) []uint32 {
 	return result
 }
 
+func union(a, b []uint32) []uint32 {
+	result := make([]uint32, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		switch {
+		case a[i] < b[j]:
+			result = append(result, a[i]); i++
+		case a[i] == b[j]:
+			result = append(result, a[i]); i++; j++
+		default:
+			result = append(result, b[j]); j++
+		}
+	}
+	result = append(result, a[i:]...)
+	result = append(result, b[j:]...)
+	return result
+}
+
+func allFileIDs(idx *index) []uint32 {
+	c := make([]uint32, len(idx.files))
+	for i := range c {
+		c[i] = uint32(i)
+	}
+	return c
+}
+
 // ---- search ----------------------------------------------------------------
 
 type searchCmd struct {
@@ -803,7 +949,16 @@ func (s *searchCmd) run() error {
 		return fmt.Errorf("invalid pattern: %w", err)
 	}
 
-	candidates := s.candidatesFromLiterals(idx, extractLiterals(s.pattern))
+	// Build AND/OR trigram plan from the regexp AST.
+	// This correctly handles alternations: (void|bool).*run\( becomes
+	// And[Or[lits("void"),lits("bool")], lits("run(")] instead of
+	// incorrectly ANDing all three.
+	syntaxRe, _ := syntax.Parse(s.pattern, syntax.Perl)
+	plan := regexpToPlan(syntaxRe)
+	candidates, unconstrained := evalPlan(idx, plan)
+	if unconstrained {
+		candidates = allFileIDs(idx)
+	}
 	fmt.Fprintf(os.Stderr, "Candidates: %d / %d files\n", len(candidates), len(idx.files))
 
 	rootDir := s.rootDir
@@ -871,7 +1026,7 @@ func (s *searchCmd) runLiteral(idx *index) error {
 	needle := []byte(s.pattern)
 
 	// Phase 1: trigram intersection using all trigrams of the full phrase.
-	candidates := s.candidatesFromLiterals(idx, []string{s.pattern})
+	candidates := candidatesFromPhrase(idx, s.pattern)
 
 	// Phase 2: bloom filter — eliminate files where the trigram→next-char
 	// association makes the phrase impossible, without reading files.
@@ -928,67 +1083,15 @@ func (s *searchCmd) runLiteral(idx *index) error {
 	return nil
 }
 
-// candidatesFromLiterals intersects posting lists for trigrams from the literals.
-func (s *searchCmd) candidatesFromLiterals(idx *index, literals []string) []uint32 {
-	allFiles := func() []uint32 {
-		c := make([]uint32, len(idx.files))
-		for i := range c {
-			c[i] = uint32(i)
-		}
-		return c
+// candidatesFromPhrase intersects posting lists for all trigrams in the literal phrase.
+// Used only by the -F path; regex path uses evalPlan instead.
+func candidatesFromPhrase(idx *index, phrase string) []uint32 {
+	ts := extractTrigrams(phrase)
+	cands, unconstrained := evalPlan(idx, planLits{ts})
+	if unconstrained {
+		return allFileIDs(idx)
 	}
-
-	var candidates []uint32
-	for li, lit := range literals {
-		ts := extractTrigrams(lit)
-		if len(ts) == 0 {
-			continue
-		}
-
-		var litCandidates []uint32
-		initialized := false
-		allPruned := true
-
-		for _, t := range ts {
-			posts, pruned := idx.lookup(t)
-			if pruned {
-				continue
-			}
-			allPruned = false
-			if posts == nil {
-				litCandidates = nil
-				initialized = true
-				break
-			}
-			if !initialized {
-				litCandidates = posts
-				initialized = true
-			} else {
-				litCandidates = intersect(litCandidates, posts)
-			}
-			if len(litCandidates) == 0 {
-				break
-			}
-		}
-
-		if allPruned {
-			continue
-		}
-
-		if li == 0 || candidates == nil {
-			candidates = litCandidates
-		} else {
-			candidates = intersect(candidates, litCandidates)
-		}
-		if len(candidates) == 0 {
-			break
-		}
-	}
-
-	if candidates == nil {
-		return allFiles()
-	}
-	return candidates
+	return cands
 }
 
 // ---- main ------------------------------------------------------------------
