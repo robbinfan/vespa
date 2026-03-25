@@ -335,7 +335,7 @@ approach with mmap is sufficient. Beyond that, a daemon or zoekt is warranted.
 
 ---
 
-## Acknowledgements
+## Acknowledgements & design diary
 
 ### English
 
@@ -364,6 +364,79 @@ because the bar was never allowed to stay where it landed.
 
 Thank you for not letting good enough be good enough.
 
+#### Conversations that shaped trex
+
+This tool was built in a single long conversation between a human and Claude.
+Below are the key turning points.
+
+**"Check out this Cursor blog"** — The starting point. The idea that a trigram
+index could make code search fast enough for an AI assistant to use in real time.
+v1 was a direct implementation: sliding window, inverted index, intersect,
+verify. It worked. 55ms, 80MB index, wrong answers on OR patterns.
+
+**"Build it, then benchmark"** — The principle that stuck through every iteration:
+implement first, measure immediately. No theoretical arguments about whether
+something would help. Build it, time it, compare it. This discipline killed
+several "obviously good" ideas that turned out to be neutral, and validated
+others that seemed marginal (bloom filter: only 3 candidates eliminated, but
+the approach compounds on longer phrases).
+
+**"Read zoekt's code, really absorb the good parts"** — This led to reading
+zoekt's `regexpInfo` and `extractStringLiterals`. The critical insight: the old
+`extractLiterals` approach ANDed all literals together, which is wrong for
+alternation patterns. `(void|bool).*run\(` would AND the trigrams of "void",
+"bool", and "run(" — wrongly requiring all three in every file. The fix was
+the AND/OR plan tree that mirrors the regexp AST. This was the single biggest
+correctness improvement: from "silently drops matches" to "zero false negatives
+verified against grep."
+
+**"What about this GitHub post?"** — Reading the
+[Blackbird writeup](https://github.blog/engineering/the-technology-behind-githubs-new-code-search/)
+introduced two ideas: boundary-biased sparse grams (still on the roadmap) and
+the general principle that index density matters. If your index is 80MB for
+16k files, something is wrong. This eventually led to varint delta encoding
+(55MB → 25MB, −55%).
+
+**"And this ripgrep thing"** — Reading BurntSushi's
+[regex crate internals](https://github.com/burntsushi/ripgrep) revealed the
+Teddy SIMD algorithm and why ripgrep is so fast for literal search. Rather than
+compete with it, integrate it: the `--rg` flag pipes candidate paths to `rg`
+for SIMD-accelerated within-file verification. Use the index for what it's good
+at (narrowing 16k files to 100), use ripgrep for what it's good at (searching
+100 files in microseconds).
+
+**"Do varint first, then smallest-posting-list-first. Log the rest to todo.md"**
+— Prioritization. Of all the remaining optimizations, varint had the biggest
+measurable impact (−55% index size) and smallest-first was free (O(k log k)
+sort, zero I/O cost). Everything else — boundary trigrams, bitset candidates,
+daemon mode — went to the backlog. Ship the high-ROI changes, defer the
+speculative ones.
+
+**Independent evaluation (Claude Opus, isolated context)** — The honest moment.
+Opus ran 101 tool calls across 9 test patterns and found:
+- Correctness: **A** — zero false negatives across all patterns including edge cases
+- The "96× speedup" claimed in the original README was **not reproducible** under
+  warm-cache conditions. Real number: 4× (13× with mmap). Fixed.
+- The bloom filter adds 42% to index size for typically <5% candidate reduction.
+  Verdict: over-engineered for the benefit. Kept it because the cost is acceptable
+  and it helps on longer phrases, but documented the tradeoff honestly.
+- Highest-ROI next step: daemon mode (eliminate 20ms Go startup + index load
+  per query). Deferred in favor of simpler mmap-default approach — good enough
+  for 2–50k file projects.
+
+**"Just default it on? Most projects are under 20–50k files anyway"** — The
+decision to default `--mmap=true` instead of building a daemon. For the target
+scale (2–50k files), OS page cache keeps the 25MB index warm across invocations.
+Warm-cache latency: 7–13ms. No daemon process to manage, no socket to debug,
+no lifecycle to handle. The simplest solution that meets the performance bar.
+
+These conversations illustrate a pattern: the best engineering doesn't come
+from the first implementation. It comes from the cycle of *build → measure →
+read what others did → understand why → rebuild*. Each reference (Cursor, zoekt,
+Blackbird, ripgrep) contributed a specific insight. Each measurement killed an
+assumption. The final product is 38KB of Go with zero dependencies, and every
+line earned its place.
+
 ---
 
 ### 中文
@@ -378,81 +451,28 @@ AND/OR 计划树，是被要求认真读 Russ Cox 的论文之后才真正吸收
 
 谢谢你不让"够用"成为终点。
 
----
+#### 塑造 trex 的关键对话
 
-## Design diary: conversations that shaped trex
+这个工具是在人和 Claude 的一次长对话中，从零到完成的。以下是改变设计方向的关键转折点。
 
-This tool was built in a single long conversation between a human and Claude.
-Below are the key turning points — the moments where a question, a reference,
-or a challenge changed the direction of the design.
+**"看看这个 Cursor 的 blog"** — 起点。Trigram 索引可以让代码搜索快到 AI 助手能实时使用。v1 是对这个想法的直接实现：滑动窗口、倒排索引、交集、验证。能跑了。55ms，80MB 索引，OR 模式给错结果。
 
----
+**"加进来，然后再评测"** — 贯穿每一轮迭代的原则：先实现，马上测。不做理论争论。写完就跑，跑完就比。这个纪律淘汰了几个"显然有用"但实际效果为零的想法，也验证了一些看起来边际收益很小的改进（bloom 过滤器：只过滤了 3 个候选，但长 phrase 下效果叠加）。
 
-**"看看这个 Cursor 的 blog"** — The starting point. The idea that a trigram
-index could make code search fast enough for an AI assistant to use in real time.
-v1 was a direct implementation of this: sliding window, inverted index, intersect,
-verify. It worked. 55ms, 80MB index, wrong answers on OR patterns.
+**"看看 zoekt 的代码，再好好吸收些好的东西"** — 读了 zoekt 的 `regexpInfo` 和 `extractStringLiterals`。关键洞察：旧的 `extractLiterals` 方法把所有 literal 用 AND 连起来，这对 alternation 模式是错的。`(void|bool).*run\(` 会把 "void"、"bool"、"run(" 的 trigram 全部 AND——要求每个文件同时包含三者。修复方案是镜像正则 AST 的 AND/OR 计划树。这是最大的正确性改进：从"静默丢结果"到"对照 grep 零漏报"。
 
-**"加进来，然后再评测"** — The principle that stuck through every iteration:
-implement first, measure immediately. No theoretical arguments about whether
-something would help. Build it, time it, compare it. This discipline killed
-several "obviously good" ideas that turned out to be neutral, and validated
-others that seemed marginal (bloom filter: only 3 candidates eliminated, but
-the approach compounds on longer phrases).
+**"这个 GitHub 的呢"** — 读了 [Blackbird 技术文章](https://github.blog/engineering/the-technology-behind-githubs-new-code-search/)，获得两个启发：boundary-biased sparse grams（仍在 roadmap）和索引密度的重要性。16k 文件 80MB 索引，说明有问题。最终导向 varint delta 编码（55MB → 25MB，−55%）。
 
-**"看看 zoekt 的代码，再好好吸收些好的东西"** — This led to reading zoekt's
-`regexpInfo` and `extractStringLiterals`. The critical insight: the old
-`extractLiterals` approach ANDed all literals together, which is wrong for
-alternation patterns. `(void|bool).*run\(` would AND the trigrams of "void",
-"bool", and "run(" — wrongly requiring all three in every file. The fix was
-the AND/OR plan tree that mirrors the regexp AST. This was the single biggest
-correctness improvement: it went from "silently drops matches" to "zero false
-negatives verified against grep."
+**"还有这个 ripgrep"** — 读了 BurntSushi 的 [regex crate 内部实现](https://github.com/burntsushi/ripgrep)，了解了 Teddy SIMD 算法和 ripgrep 为什么做 literal 搜索这么快。与其和它竞争，不如集成它：`--rg` flag 把候选文件路径交给 `rg` 做 SIMD 加速的文件内验证。让索引做它擅长的事（把 16k 文件缩到 100 个），让 ripgrep 做它擅长的事（在 100 个文件里微秒级搜索）。
 
-**"这个 GitHub 的呢"** — Reading the
-[Blackbird writeup](https://github.blog/engineering/the-technology-behind-githubs-new-code-search/)
-introduced two ideas: boundary-biased sparse grams (still on the roadmap) and
-the general principle that index density matters. If your index is 80MB for
-16k files, something is wrong. This eventually led to varint delta encoding
-(55MB → 25MB, −55%).
+**"先做 varint，再做最小 posting list 优先。其他记到 todo.md"** — 优先级排序。在所有剩余优化中，varint 的可测量收益最大（索引 −55%），smallest-first 是免费的（O(k log k) 排序，零 I/O 开销）。其他的——boundary trigram、bitset 候选集、daemon 模式——全部进 backlog。先发高 ROI 的变更，推迟投机性的。
 
-**"还有这个 ripgrep"** — Reading BurntSushi's
-[regex crate internals](https://github.com/burntsushi/ripgrep) revealed the
-Teddy SIMD algorithm and why ripgrep is so fast for literal search. Rather than
-compete with it, integrate it: the `--rg` flag pipes candidate paths to `rg`
-for SIMD-accelerated within-file verification. Use the index for what it's good
-at (narrowing 16k files to 100), use ripgrep for what it's good at (searching
-100 files in microseconds).
+**独立评测（Claude Opus，隔离上下文）** — 诚实面对的时刻。Opus 用 101 次工具调用跑了 9 个测试 pattern，发现：
+- 正确性：**A** — 所有 pattern 含边界情况，零漏报
+- 原 README 声称的"96× 加速"在 warm cache 下**不可复现**。真实数字：4×（mmap 下 13×）。已修正。
+- Bloom 过滤器占索引 42% 的体积，但通常只减少不到 5% 的候选。结论：相对于收益来说过度工程。保留了，因为开销可接受且长 phrase 有帮助，但如实记录了这个 tradeoff。
+- 最高 ROI 的下一步：daemon 模式（消除每次查询 20ms 的 Go 启动 + 索引加载）。最终选择了更简单的 mmap 默认方案。
 
-**"先做 varint，再做最小 posting list 优先。其他记到 todo.md"** — Prioritization.
-Of all the remaining optimizations, varint had the biggest measurable impact
-(−55% index size) and smallest-first was free (O(k log k) sort, zero I/O cost).
-Everything else — boundary trigrams, bitset candidates, daemon mode — went to
-the backlog. Ship the high-ROI changes, defer the speculative ones.
+**"默认开着？其实大部分项目也就 2-5 万以内"** — 决定 `--mmap=true` 为默认值，而不是搞 daemon。对于目标规模（2–5 万文件），OS page cache 在调用之间保持 25MB 索引常驻。Warm cache 延迟：7–13ms。不需要管理 daemon 进程、不需要调试 socket、不需要处理生命周期。满足性能线的最简方案。
 
-**Independent evaluation (Claude Opus, isolated context)** — The honest moment.
-Opus ran 101 tool calls across 9 test patterns and found:
-- Correctness: **A** — zero false negatives across all patterns including edge cases
-- The "96× speedup" claimed in the original README was **not reproducible** under
-  warm-cache conditions. Real number: 4× (13× with mmap). Fixed.
-- The bloom filter adds 42% to index size for typically <5% candidate reduction.
-  Verdict: over-engineered for the benefit. Kept it because the cost is acceptable
-  and it helps on longer phrases, but documented the tradeoff honestly.
-- Highest-ROI next step: daemon mode (eliminate 20ms Go startup + index load
-  per query). Deferred in favor of simpler mmap-default approach — good enough
-  for 2–50k file projects.
-
-**"默认开着？其实大部分项目也就 2-5 万以内"** — The decision to default `--mmap=true`
-instead of building a daemon. For the target scale (2–50k files), OS page cache
-keeps the 25MB index warm across invocations. Warm-cache latency: 7–13ms.
-No daemon process to manage, no socket to debug, no lifecycle to handle.
-The simplest solution that meets the performance bar.
-
----
-
-These conversations illustrate a pattern: the best engineering doesn't come
-from the first implementation. It comes from the cycle of *build → measure →
-read what others did → understand why → rebuild*. Each reference (Cursor, zoekt,
-Blackbird, ripgrep) contributed a specific insight. Each measurement killed an
-assumption. The final product is 38KB of Go with zero dependencies, and every
-line earned its place.
+这些对话说明了一个模式：最好的工程不来自第一次实现，而来自 *构建 → 测量 → 读别人怎么做的 → 理解为什么 → 重新构建* 的循环。每一个参考（Cursor、zoekt、Blackbird、ripgrep）贡献了一个具体的洞察。每一次测量杀死了一个假设。最终产物是 38KB 的 Go 代码，零依赖，每一行都有它存在的理由。
