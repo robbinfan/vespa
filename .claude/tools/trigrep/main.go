@@ -1314,7 +1314,7 @@ func main() {
 	searchFilesOnly := searchFlags.Bool("files-only", false, "only print matching file paths")
 	searchContext := searchFlags.Int("context", 2, "lines of context around matches")
 	searchRoot := searchFlags.String("root", ".", "root directory for resolving file paths")
-	searchMmap := searchFlags.Bool("mmap", false, "use mmap to load index (lower cold-start cost, experimental)")
+	searchMmap := searchFlags.Bool("mmap", true, "use mmap to load index (default on; --mmap=false to disable)")
 	searchRg := searchFlags.Bool("rg", false, "use ripgrep for within-file verification (faster matching via SIMD)")
 
 	if len(os.Args) < 2 {
