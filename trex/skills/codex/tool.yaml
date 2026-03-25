@@ -1,0 +1,48 @@
+# trex — OpenAI Codex / ChatGPT tool definition
+#
+# Add this to your Codex agent's tool list.
+# Requires: trex binary built and index created.
+#
+# Setup:
+#   go build -o trex . && ./trex build --dir /path/to/repo
+
+tools:
+  - name: trex_search
+    description: >
+      Fast trigram-indexed code search. Returns file paths matching the given
+      regex or literal pattern. Much faster than grep/ripgrep for selective
+      patterns (3-13x speedup). Use for finding definitions, references, or
+      any code pattern across the repository.
+    parameters:
+      pattern:
+        type: string
+        description: "Regex pattern to search for"
+        required: true
+      literal:
+        type: boolean
+        description: "Treat pattern as fixed string (faster, bloom-filtered)"
+        default: false
+      files_only:
+        type: boolean
+        description: "Only return file paths, no line content"
+        default: true
+    command: |
+      .claude/tools/trex/trex search \
+        --pattern '{pattern}' \
+        --root . \
+        $([ "{literal}" = "true" ] && echo "-F") \
+        $([ "{files_only}" = "true" ] && echo "--files-only")
+
+  - name: trex_build
+    description: "Build or update the trigram search index"
+    parameters:
+      incremental:
+        type: boolean
+        description: "Incremental update (faster, only re-indexes changed files)"
+        default: true
+    command: |
+      if [ "{incremental}" = "true" ]; then
+        .claude/tools/trex/trex update --dir .
+      else
+        .claude/tools/trex/trex build --dir .
+      fi
