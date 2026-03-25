@@ -118,11 +118,26 @@ public:
     bool needs_fusion() const;
 
     /**
-     * Flush the current memory index to a new hnsw.flush.<id>/ directory.
-     * Reads float32 vectors via the DocVectorAccess supplied at construction.
+     * Flush the current memory index to a new hnsw.flush.<id>/ directory,
+     * then evict the flushed docids from the in-memory HNSW graph.
+     *
+     * Post-flush invariant (multi-version correctness):
+     *   - Docids [0, committed_doc_id_limit) are owned by the new disk index.
+     *   - Those docids are removed from the memory HNSW graph via
+     *     remove_document(), so the next flush snapshot doesn't re-include them.
+     *   - Updates or new insertions after this call go exclusively to the
+     *     memory graph and are not part of any existing disk index.
+     *   - DenseTensorStore is unchanged: float32 vectors remain accessible for
+     *     summary features and reranking regardless of graph state.
+     *
+     * Lifetime of a document version:
+     *   add(id)              → id enters memory graph
+     *   flush(limit)         → id copied to disk, removed from memory graph
+     *   remove(id)           → id tombstoned in all disk indexes + removed from mem
+     *   update(id, new_vec)  → remove(id) + add(id); only new version in memory
+     *   run_fusion()         → only alive versions merged; deduped by global docid
      *
      * @param committed_doc_id_limit  One-past-the-last committed docid.
-     *                                Docids 0..committed_doc_id_limit-1 are considered.
      * @return flush id (>0) on success, 0 on failure or empty index.
      *
      * Must be called off the attribute writer thread.

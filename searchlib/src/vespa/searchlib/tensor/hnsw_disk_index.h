@@ -80,6 +80,12 @@ public:
     /** Map local slot → global docid. */
     uint32_t local_to_global(uint32_t local_id) const { return _docid_map[local_id]; }
 
+    /** True if the local slot is alive (not tombstoned). Thread-safe. */
+    bool is_alive(uint32_t local_id) const {
+        std::lock_guard guard(_alive_mutex);
+        return _alive && _alive->testBit(local_id);
+    }
+
     /** Get raw (possibly compressed) vector bytes for local slot. */
     const void* raw_vector(uint32_t local_id) const;
 

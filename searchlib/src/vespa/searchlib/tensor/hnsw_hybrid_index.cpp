@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <numeric>
 #include <stdexcept>
+#include <unordered_map>
 
 #include <vespa/log/log.h>
 LOG_SETUP(".tensor.hnsw_hybrid_index");
@@ -378,10 +379,37 @@ uint32_t HnswHybridIndex::flush_memory_index(uint32_t committed_doc_id_limit)
         return 0;
     }
 
-    std::unique_lock lock(_disk_mutex);
-    _disk_indexes.push_back(di);
-    LOG(info, "HnswHybridIndex: flushed memory index to hnsw.flush.%u (%u docs, %u dims)",
-        fid, n, dims);
+    {
+        std::unique_lock lock(_disk_mutex);
+        _disk_indexes.push_back(di);
+    }
+
+    // --- Reset: evict flushed docids from the memory graph ---
+    //
+    // After a successful flush, docids [0, committed_doc_id_limit) are owned
+    // by the new disk index.  We remove them from the in-memory HNSW graph so
+    // that:
+    //   1. The memory graph only covers post-flush docids (no duplication).
+    //   2. The next flush snapshot doesn't re-include already-persisted docs.
+    //   3. Updates arriving after the flush only touch the memory graph,
+    //      which starts clean with respect to the flushed range.
+    //
+    // remove_document() does proper graph surgery (neighbor reconnection),
+    // so subsequent memory-only searches remain correct.
+    //
+    // NOTE: the DenseTensorStore is NOT touched — vectors stay there for
+    //       summary features and reranking regardless of HNSW graph state.
+    for (uint32_t i = 0; i < n; ++i) {
+        // Only remove if still in the graph (alive docs; deleted ones are
+        // already absent from the memory graph).
+        if (graph.get_node_ref(i).valid()) {
+            _memory_index->remove_document(i);
+        }
+    }
+
+    LOG(info, "HnswHybridIndex: flushed memory index to hnsw.flush.%u (%u docs, %u dims); "
+        "memory graph reset for [0, %u)",
+        fid, n, dims, n);
     return fid;
 }
 
@@ -416,26 +444,46 @@ bool HnswHybridIndex::run_fusion()
 
     uint32_t dims = inputs[0]->dims();
 
-    // --- Collect all alive vectors across all disk indexes ---
+    // --- Collect all ALIVE vectors across all disk indexes ---
+    //
+    // Invariant we enforce here:
+    //   Each global docid appears at most once in the fusion output.
+    //   If a docid is alive in multiple disk indexes (can happen when memory
+    //   reset after flush was skipped in a previous session), we keep the
+    //   LAST version we encounter — disk indexes are ordered oldest-first,
+    //   so iterating in reverse and using an unordered_set lets us pick the
+    //   most recently flushed copy.
+    //
+    // Tombstoned entries (alive bit = 0) are skipped entirely.  They
+    // correspond to:
+    //   - Hard deletes:  remove_document() was called.
+    //   - Soft deletes / updates: the new version lives in a later disk
+    //     index or the current memory index; the old version is tombstoned.
+
     std::vector<uint32_t> new_docids;
     std::vector<float>    new_vecs;
+    std::unordered_map<uint32_t, uint32_t> docid_to_slot; // gid → index in new_docids
 
+    // Iterate oldest-to-newest; later entries overwrite earlier ones for the
+    // same global docid, keeping the most recent alive version.
     for (const auto& di : inputs) {
         for (uint32_t li = 0; li < di->num_docs(); ++li) {
-            // Only include alive documents
-            {
-                // Check via alive_count proxy: get_float_vector is only called for alive docs.
-                // We peek at the alive status by checking alive_count() after we decide.
-                // The proper way: the disk index exposes is_alive(local_id) — add a helper.
-            }
-            // For now, use get_float_vector and check alive via alive_ratio heuristic.
-            // A correct approach requires exposing is_alive(local_id) from HnswDiskIndex.
-            // We query each slot: if the reverse map returns a valid global docid and
-            // it hasn't been removed, include it.
-            auto fvec = di->get_float_vector(li);
+            if (!di->is_alive(li)) continue;   // skip tombstones
+
             uint32_t gid = di->local_to_global(li);
-            new_docids.push_back(gid);
-            new_vecs.insert(new_vecs.end(), fvec.begin(), fvec.end());
+            auto fvec = di->get_float_vector(li);
+
+            auto it = docid_to_slot.find(gid);
+            if (it != docid_to_slot.end()) {
+                // Same global docid seen before — overwrite with this (newer) version.
+                uint32_t slot = it->second;
+                std::copy(fvec.begin(), fvec.end(),
+                          new_vecs.begin() + slot * dims);
+            } else {
+                docid_to_slot[gid] = static_cast<uint32_t>(new_docids.size());
+                new_docids.push_back(gid);
+                new_vecs.insert(new_vecs.end(), fvec.begin(), fvec.end());
+            }
         }
     }
 
