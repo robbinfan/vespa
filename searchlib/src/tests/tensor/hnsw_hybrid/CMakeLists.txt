@@ -8,11 +8,11 @@ vespa_add_executable(searchlib_hnsw_hybrid_test_app TEST
 )
 vespa_add_test(NAME searchlib_hnsw_hybrid_test_app COMMAND searchlib_hnsw_hybrid_test_app)
 
-vespa_add_executable(searchlib_hnsw_compression_benchmark_app TEST
+vespa_add_executable(searchlib_hnsw_hybrid_bench_app TEST
     SOURCES
-    compression_benchmark.cpp
+    hybrid_bench.cpp
     DEPENDS
     searchlib
 )
-vespa_add_test(NAME searchlib_hnsw_compression_benchmark_app
-    COMMAND searchlib_hnsw_compression_benchmark_app)
+vespa_add_test(NAME searchlib_hnsw_hybrid_bench_app
+    COMMAND searchlib_hnsw_hybrid_bench_app)
