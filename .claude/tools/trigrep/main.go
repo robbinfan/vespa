@@ -10,8 +10,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -29,10 +32,30 @@ import (
 //   TrigramTable: same as v2
 //   PostingLists: same as v2
 //
+// Version 4 (adds per-entry bloom byte for "3.5-gram" phrase pre-filtering):
+//   Header:       same as v3
+//   FileTable:    same as v3
+//   TrigramTable: same as v3
+//   PostingLists: uint32 file IDs  (same layout)
+//   BloomData:    uint8 per posting entry, parallel to PostingLists
+//
+// The bloom byte encodes which "next-byte class" groups follow this trigram in
+// the file: bit i is set if any byte in the range [i*32, i*32+31] immediately
+// follows the trigram at some position. This lets -F phrase search eliminate
+// candidates without reading files (no false negatives, some false positives).
+//
 // count == 0 in TrigramTable means the trigram was pruned (too frequent).
 
 const magic = 0x54524749 // "TRGI"
-const version = 3
+const indexVersion = 4
+
+// ---- posting entry ---------------------------------------------------------
+
+// postingEntry pairs a file ID with its bloom byte for one trigram.
+type postingEntry struct {
+	fileID uint32
+	bloom  uint8
+}
 
 // ---- trigram helpers -------------------------------------------------------
 
@@ -168,8 +191,10 @@ func collectFiles(dir, exts, ignore string) ([]fileInfo, error) {
 	return files, err
 }
 
-// extractTrigramsFromFile reads a file and returns the set of unique trigrams.
-func extractTrigramsFromFile(absPath string) map[uint32]bool {
+// extractTrigramsFromFile reads a file and returns the set of unique trigrams
+// with their bloom byte. The bloom byte records which "next-byte class" groups
+// (bit i = chars [i*32, i*32+31]) follow the trigram somewhere in this file.
+func extractTrigramsFromFile(absPath string) map[uint32]uint8 {
 	f, err := os.Open(absPath)
 	if err != nil {
 		return nil
@@ -179,15 +204,18 @@ func extractTrigramsFromFile(absPath string) map[uint32]bool {
 	if err != nil {
 		return nil
 	}
-	seen := make(map[uint32]bool)
+	bloom := make(map[uint32]uint8)
 	for i := 0; i+3 <= len(content); i++ {
 		t := uint32(content[i])<<16 | uint32(content[i+1])<<8 | uint32(content[i+2])
-		seen[t] = true
+		bloom[t] |= 0 // ensure key exists even with no next byte
+		if i+3 < len(content) {
+			bloom[t] |= 1 << (content[i+3] >> 5)
+		}
 	}
-	return seen
+	return bloom
 }
 
-// ---- build (full) ----------------------------------------------------------
+// ---- build (full, parallel) ------------------------------------------------
 
 type buildCmd struct {
 	dir     string
@@ -195,6 +223,11 @@ type buildCmd struct {
 	exts    string
 	ignore  string
 	maxFreq float64
+}
+
+type fileResult struct {
+	fileID  int
+	trigrams map[uint32]uint8
 }
 
 func (b *buildCmd) run() error {
@@ -206,21 +239,48 @@ func (b *buildCmd) run() error {
 	}
 	fmt.Fprintf(os.Stderr, "Indexing %d files...\n", len(files))
 
-	posting := make(map[uint32][]uint32)
-	for i, fi := range files {
-		if i%1000 == 0 && i > 0 {
-			fmt.Fprintf(os.Stderr, "  %d/%d files processed\n", i, len(files))
+	// Parallel file reading + trigram extraction.
+	// Launcher runs in its own goroutine so the main goroutine can drain
+	// results immediately — avoids deadlock when results channel fills up.
+	results := make(chan fileResult, runtime.NumCPU()*4)
+	sem := make(chan struct{}, runtime.NumCPU())
+	var wg sync.WaitGroup
+	go func() {
+		for i, fi := range files {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(i int, fi fileInfo) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				tgrams := extractTrigramsFromFile(filepath.Join(b.dir, fi.path))
+				results <- fileResult{i, tgrams}
+			}(i, fi)
 		}
-		trigrams := extractTrigramsFromFile(filepath.Join(b.dir, fi.path))
-		for t := range trigrams {
-			posting[t] = append(posting[t], uint32(i))
+		wg.Wait()
+		close(results)
+	}()
+
+	// Collect all results, then sort by fileID so posting lists stay naturally
+	// ordered — avoids per-list sort of 13M+ entries.
+	allResults := make([]fileResult, 0, len(files))
+	for r := range results {
+		allResults = append(allResults, r)
+	}
+	sort.Slice(allResults, func(i, j int) bool {
+		return allResults[i].fileID < allResults[j].fileID
+	})
+
+	posting := make(map[uint32][]postingEntry)
+	for i, r := range allResults {
+		for t, bl := range r.trigrams {
+			posting[t] = append(posting[t], postingEntry{uint32(r.fileID), bl})
+		}
+		if (i+1)%2000 == 0 {
+			fmt.Fprintf(os.Stderr, "  %d/%d files processed\n", i+1, len(files))
 		}
 	}
 
-	if err := writeIndex(b.output, files, posting, b.maxFreq, start); err != nil {
-		return err
-	}
-	return nil
+	return writeIndex(b.output, files, posting, b.maxFreq, start)
 }
 
 // ---- update (incremental) --------------------------------------------------
@@ -236,8 +296,7 @@ type updateCmd struct {
 func (u *updateCmd) run() error {
 	start := time.Now()
 
-	// Load existing index.
-	idx, err := loadIndex(u.indexPath)
+	idx, err := loadIndex(u.indexPath, false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Cannot load existing index (%v), falling back to full build.\n", err)
 		b := &buildCmd{dir: u.dir, output: u.indexPath, exts: u.exts, ignore: u.ignore, maxFreq: u.maxFreq}
@@ -249,13 +308,11 @@ func (u *updateCmd) run() error {
 		return b.run()
 	}
 
-	// Collect current files from disk.
 	newFiles, err := collectFiles(u.dir, u.exts, u.ignore)
 	if err != nil {
 		return err
 	}
 
-	// Build lookup: rel-path → old index position + metadata.
 	type oldMeta struct {
 		idx   int
 		mtime int64
@@ -266,8 +323,7 @@ func (u *updateCmd) run() error {
 		oldByPath[fi.path] = oldMeta{i, fi.mtime, fi.size}
 	}
 
-	// Classify files.
-	unchangedOldID := make([]int, len(newFiles)) // newFID → oldFID (-1 if changed/new)
+	unchangedOldID := make([]int, len(newFiles))
 	for i := range unchangedOldID {
 		unchangedOldID[i] = -1
 	}
@@ -296,65 +352,72 @@ func (u *updateCmd) run() error {
 	fmt.Fprintf(os.Stderr, "Files: %d total, %d unchanged, %d modified, %d added, %d deleted\n",
 		len(newFiles), unchanged, modified, added, deleted)
 
-	// If most files changed, a full rebuild is cheaper than inversion.
 	if unchanged < len(newFiles)/2 {
 		fmt.Fprintf(os.Stderr, "Too many changes, doing full rebuild.\n")
 		b := &buildCmd{dir: u.dir, output: u.indexPath, exts: u.exts, ignore: u.ignore, maxFreq: u.maxFreq}
 		return b.run()
 	}
 
-	// Invert the old posting lists into per-oldFile trigram slices.
-	// Use [][]uint32 (not maps) to avoid hash overhead on 13M+ pairs.
-	// Mark slots for changed/deleted files as nil to skip them.
-	perFileTrigrams := make([][]uint32, len(idx.files))
+	// Invert posting lists into per-oldFile (trigram, bloom) slices.
+	// For v3 indexes (no bloom), use 0xFF (all bits set) as conservative placeholder.
+	hasBloom := idx.version >= 4 && len(idx.bloomData) > 0
+
+	type trigramBloom struct {
+		trigram uint32
+		bloom   uint8
+	}
+	perFile := make([][]trigramBloom, len(idx.files))
 	for newFID, oldID := range unchangedOldID {
 		if oldID >= 0 {
 			_ = newFID
-			if perFileTrigrams[oldID] == nil {
-				perFileTrigrams[oldID] = make([]uint32, 0, 128)
+			if perFile[oldID] == nil {
+				perFile[oldID] = make([]trigramBloom, 0, 128)
 			}
 		}
 	}
-	// Collect pruned trigrams: their posting lists weren't stored, so we can't
-	// invert them normally. Treat them as present in ALL unchanged files so
-	// writeIndex sees the correct high count and re-prunes them. Without this,
-	// a pruned common trigram appears in only the changed files, causing
-	// false-negative search results.
-	var prunedTrigrams []uint32
+
+	// Pruned trigrams: not stored in posting lists; add to all unchanged files
+	// as 0xFF bloom so writeIndex re-prunes them correctly.
+	var prunedEntries []trigramBloom
 	data := idx.data
 	for ti, t := range idx.trigrams {
 		cnt := idx.counts[ti]
 		if cnt == 0 {
-			prunedTrigrams = append(prunedTrigrams, t)
+			prunedEntries = append(prunedEntries, trigramBloom{t, 0xFF})
 			continue
 		}
 		off := idx.offsets[ti]
+		relBase := (off - idx.postingBase) / 4
 		for i := uint32(0); i < cnt; i++ {
 			fid := binary.LittleEndian.Uint32(data[off+i*4:])
-			if perFileTrigrams[fid] != nil {
-				perFileTrigrams[fid] = append(perFileTrigrams[fid], t)
+			if perFile[fid] != nil {
+				var bl uint8
+				if hasBloom {
+					bl = idx.bloomData[relBase+i]
+				} else {
+					bl = 0xFF
+				}
+				perFile[fid] = append(perFile[fid], trigramBloom{t, bl})
 			}
 		}
 	}
-	// Add all pruned trigrams to every unchanged file.
-	for oldID, pft := range perFileTrigrams {
-		if pft != nil {
-			perFileTrigrams[oldID] = append(pft, prunedTrigrams...)
+	for oldID, pf := range perFile {
+		if pf != nil {
+			perFile[oldID] = append(pf, prunedEntries...)
 		}
 	}
 
-	// Build new posting map: reuse inverted slices for unchanged files,
-	// re-read disk only for changed/new files.
-	posting := make(map[uint32][]uint32)
+	// Build new posting map.
+	posting := make(map[uint32][]postingEntry)
 	for newFID, fi := range newFiles {
 		oldID := unchangedOldID[newFID]
 		if oldID >= 0 {
-			for _, t := range perFileTrigrams[oldID] {
-				posting[t] = append(posting[t], uint32(newFID))
+			for _, tb := range perFile[oldID] {
+				posting[tb.trigram] = append(posting[tb.trigram], postingEntry{uint32(newFID), tb.bloom})
 			}
 		} else {
-			for t := range extractTrigramsFromFile(filepath.Join(u.dir, fi.path)) {
-				posting[t] = append(posting[t], uint32(newFID))
+			for t, bl := range extractTrigramsFromFile(filepath.Join(u.dir, fi.path)) {
+				posting[t] = append(posting[t], postingEntry{uint32(newFID), bl})
 			}
 		}
 	}
@@ -364,7 +427,7 @@ func (u *updateCmd) run() error {
 
 // ---- index write -----------------------------------------------------------
 
-func writeIndex(output string, files []fileInfo, posting map[uint32][]uint32, maxFreq float64, start time.Time) error {
+func writeIndex(output string, files []fileInfo, posting map[uint32][]postingEntry, maxFreq float64, start time.Time) error {
 	pruneThreshold := 0
 	if maxFreq > 0 && maxFreq < 1.0 {
 		pruneThreshold = int(maxFreq * float64(len(files)))
@@ -376,11 +439,11 @@ func writeIndex(output string, files []fileInfo, posting map[uint32][]uint32, ma
 	}
 	sort.Slice(trigrams, func(i, j int) bool { return trigrams[i] < trigrams[j] })
 
-	prunedCount := 0
+	pruned := make(map[uint32]bool)
 	if pruneThreshold > 0 {
 		for _, t := range trigrams {
 			if len(posting[t]) > pruneThreshold {
-				prunedCount++
+				pruned[t] = true
 			}
 		}
 	}
@@ -388,7 +451,6 @@ func writeIndex(output string, files []fileInfo, posting map[uint32][]uint32, ma
 	if err := os.MkdirAll(filepath.Dir(output), 0755); err != nil {
 		return err
 	}
-	// Write to temp file, then rename for atomicity.
 	tmp := output + ".tmp"
 	out, err := os.Create(tmp)
 	if err != nil {
@@ -414,11 +476,11 @@ func writeIndex(output string, files []fileInfo, posting map[uint32][]uint32, ma
 
 	// Header
 	write32(magic)
-	write32(version) // v3
+	write32(indexVersion) // v4
 	write32(uint32(len(files)))
 	write32(uint32(len(trigrams)))
 
-	// File table (v3: path + mtime + size)
+	// File table
 	for _, fi := range files {
 		write16(uint16(len(fi.path)))
 		w.WriteString(fi.path)
@@ -430,7 +492,7 @@ func writeIndex(output string, files []fileInfo, posting map[uint32][]uint32, ma
 	headerSize := 16
 	fileTableSize := 0
 	for _, fi := range files {
-		fileTableSize += 2 + len(fi.path) + 16 // pathLen + path + mtime(8) + size(8)
+		fileTableSize += 2 + len(fi.path) + 16
 	}
 	trigramTableSize := len(trigrams) * 12
 	postingStart := uint32(headerSize + fileTableSize + trigramTableSize)
@@ -440,9 +502,9 @@ func writeIndex(output string, files []fileInfo, posting map[uint32][]uint32, ma
 	for _, t := range trigrams {
 		cnt := uint32(len(posting[t]))
 		write32(t)
-		if pruneThreshold > 0 && int(cnt) > pruneThreshold {
-			write32(0) // offset sentinel
-			write32(0) // count=0 signals pruned
+		if pruned[t] {
+			write32(0)
+			write32(0)
 		} else {
 			write32(offset)
 			write32(cnt)
@@ -450,13 +512,23 @@ func writeIndex(output string, files []fileInfo, posting map[uint32][]uint32, ma
 		}
 	}
 
-	// Posting lists (non-pruned only)
+	// Posting lists (fileIDs, non-pruned only)
 	for _, t := range trigrams {
-		if pruneThreshold > 0 && len(posting[t]) > pruneThreshold {
+		if pruned[t] {
 			continue
 		}
-		for _, fid := range posting[t] {
-			write32(fid)
+		for _, e := range posting[t] {
+			write32(e.fileID)
+		}
+	}
+
+	// Bloom section (1 byte per posting entry, parallel to posting lists)
+	for _, t := range trigrams {
+		if pruned[t] {
+			continue
+		}
+		for _, e := range posting[t] {
+			w.WriteByte(e.bloom)
 		}
 	}
 
@@ -475,7 +547,7 @@ func writeIndex(output string, files []fileInfo, posting map[uint32][]uint32, ma
 	if pruneThreshold > 0 {
 		fmt.Fprintf(os.Stderr,
 			"Index written in %v: %d files, %d trigrams (%d pruned, freq>%.0f%%) -> %s\n",
-			elapsed, len(files), len(trigrams), prunedCount, maxFreq*100, output)
+			elapsed, len(files), len(trigrams), len(pruned), maxFreq*100, output)
 	} else {
 		fmt.Fprintf(os.Stderr,
 			"Index written in %v: %d files, %d unique trigrams -> %s\n",
@@ -487,19 +559,47 @@ func writeIndex(output string, files []fileInfo, posting map[uint32][]uint32, ma
 // ---- index load ------------------------------------------------------------
 
 type index struct {
-	version  uint32
-	files    []fileInfo
-	trigrams []uint32 // sorted
-	offsets  []uint32
-	counts   []uint32 // count==0 means pruned
-	data     []byte
+	version     uint32
+	files       []fileInfo
+	trigrams    []uint32 // sorted
+	offsets     []uint32
+	counts      []uint32 // count==0 means pruned
+	data        []byte
+	postingBase uint32 // byte offset of start of posting lists in data
+	bloomData   []byte // nil for v3 and earlier
 }
 
-func loadIndex(path string) (*index, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
+func loadIndex(path string, useMmap bool) (*index, error) {
+	var data []byte
+	if useMmap {
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		fi, err := f.Stat()
+		if err != nil {
+			f.Close()
+			return nil, err
+		}
+		size := int(fi.Size())
+		if size == 0 {
+			f.Close()
+			return nil, fmt.Errorf("index is empty")
+		}
+		mapped, err := syscall.Mmap(int(f.Fd()), 0, size, syscall.PROT_READ, syscall.MAP_SHARED)
+		f.Close() // fd can be closed after mmap; mapping stays valid
+		if err != nil {
+			return nil, fmt.Errorf("mmap: %w", err)
+		}
+		data = mapped
+	} else {
+		var err error
+		data, err = os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
 	}
+
 	if len(data) < 16 {
 		return nil, fmt.Errorf("index too small")
 	}
@@ -546,14 +646,51 @@ func loadIndex(path string) (*index, error) {
 		pos += 12
 	}
 
-	return &index{
-		version:  ver,
-		files:    files,
-		trigrams: trigrams,
-		offsets:  offsets,
-		counts:   counts,
-		data:     data,
-	}, nil
+	postingBase := uint32(pos)
+
+	// Compute total posting entries to locate bloom section.
+	var totalEntries uint32
+	for _, cnt := range counts {
+		totalEntries += cnt
+	}
+
+	idx := &index{
+		version:     ver,
+		files:       files,
+		trigrams:    trigrams,
+		offsets:     offsets,
+		counts:      counts,
+		data:        data,
+		postingBase: postingBase,
+	}
+
+	// Parse bloom section (v4+).
+	if ver >= 4 {
+		bloomStart := int(postingBase) + int(totalEntries)*4
+		bloomEnd := bloomStart + int(totalEntries)
+		if bloomEnd <= len(data) {
+			idx.bloomData = data[bloomStart:bloomEnd]
+		}
+	}
+
+	return idx, nil
+}
+
+// findTrigram returns the table index of trigram t, or -1 if not found.
+func (idx *index) findTrigram(t uint32) int {
+	lo, hi := 0, len(idx.trigrams)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if idx.trigrams[mid] < t {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo >= len(idx.trigrams) || idx.trigrams[lo] != t {
+		return -1
+	}
+	return lo
 }
 
 // postingList returns file IDs for trigram at table index ti.
@@ -572,22 +709,14 @@ func (idx *index) postingList(ti int) []uint32 {
 
 // lookup returns (list, pruned) for trigram value t.
 func (idx *index) lookup(t uint32) ([]uint32, bool) {
-	lo, hi := 0, len(idx.trigrams)
-	for lo < hi {
-		mid := (lo + hi) / 2
-		if idx.trigrams[mid] < t {
-			lo = mid + 1
-		} else {
-			hi = mid
-		}
-	}
-	if lo >= len(idx.trigrams) || idx.trigrams[lo] != t {
+	ti := idx.findTrigram(t)
+	if ti < 0 {
 		return nil, false
 	}
-	if idx.counts[lo] == 0 {
-		return nil, true // pruned
+	if idx.counts[ti] == 0 {
+		return nil, true
 	}
-	return idx.postingList(lo), false
+	return idx.postingList(ti), false
 }
 
 func intersect(a, b []uint32) []uint32 {
@@ -607,27 +736,78 @@ func intersect(a, b []uint32) []uint32 {
 	return result
 }
 
+// bloomFilter applies the bloom pre-filter to candidates using phrase trigrams.
+// For each trigram at position i in phrase where phrase[i+3] is known,
+// eliminates candidates whose stored bloom byte doesn't include the expected
+// next-byte class. Zero false negatives; some false positives are expected.
+//
+// Bloom byte encoding: bit k is set if any byte in [k*32, k*32+31] follows
+// the trigram in this file. nextBit = 1 << (phrase[i+3] >> 5).
+func (idx *index) bloomFilter(candidates []uint32, phrase []byte) []uint32 {
+	if len(idx.bloomData) == 0 || len(phrase) < 4 {
+		return candidates
+	}
+	for i := 0; i+4 <= len(phrase); i++ {
+		t := uint32(phrase[i])<<16 | uint32(phrase[i+1])<<8 | uint32(phrase[i+2])
+		nextBit := uint8(1 << (phrase[i+3] >> 5))
+
+		ti := idx.findTrigram(t)
+		if ti < 0 || idx.counts[ti] == 0 {
+			continue
+		}
+
+		off := idx.offsets[ti]
+		cnt := idx.counts[ti]
+		relBase := (off - idx.postingBase) / 4
+
+		// Merge-scan: both candidates and posting list are sorted by fileID.
+		filtered := candidates[:0]
+		ci, pi := 0, uint32(0)
+		for ci < len(candidates) && pi < cnt {
+			fid := binary.LittleEndian.Uint32(idx.data[off+pi*4:])
+			c := candidates[ci]
+			switch {
+			case fid < c:
+				pi++
+			case fid == c:
+				if idx.bloomData[relBase+pi]&nextBit != 0 {
+					filtered = append(filtered, c)
+				}
+				ci++
+				pi++
+			default: // fid > c: candidate not in this posting (conservative: keep)
+				filtered = append(filtered, c)
+				ci++
+			}
+		}
+		// Any remaining candidates past end of posting list: keep conservatively.
+		filtered = append(filtered, candidates[ci:]...)
+		candidates = filtered
+		if len(candidates) == 0 {
+			break
+		}
+	}
+	return candidates
+}
+
 // ---- search ----------------------------------------------------------------
 
 type searchCmd struct {
 	indexPath string
 	pattern   string
-	literal   bool // -F: treat pattern as fixed string, not regex
+	literal   bool
 	filesOnly bool
 	context   int
 	rootDir   string
+	useMmap   bool
 }
 
 func (s *searchCmd) run() error {
-	idx, err := loadIndex(s.indexPath)
+	idx, err := loadIndex(s.indexPath, s.useMmap)
 	if err != nil {
 		return fmt.Errorf("loading index: %w", err)
 	}
 
-	// In literal (-F) mode the pattern is a plain substring, not a regex.
-	// We use all its trigrams directly (no metachar escaping needed) and
-	// verify with bytes.Contains instead of regexp — this is "phrase aware":
-	// the full phrase including punctuation like () contributes to filtering.
 	if s.literal {
 		return s.runLiteral(idx)
 	}
@@ -638,7 +818,6 @@ func (s *searchCmd) run() error {
 	}
 
 	candidates := s.candidatesFromLiterals(idx, extractLiterals(s.pattern))
-
 	fmt.Fprintf(os.Stderr, "Candidates: %d / %d files\n", len(candidates), len(idx.files))
 
 	rootDir := s.rootDir
@@ -701,18 +880,22 @@ func (s *searchCmd) run() error {
 	return nil
 }
 
-// runLiteral handles -F (fixed string) search.
-// Phrase-aware: uses ALL trigrams of the literal phrase for pre-filtering,
-// then verifies with bytes.Contains — no regex metacharacter ambiguity.
+// runLiteral handles -F (fixed string) search with bloom pre-filter.
 func (s *searchCmd) runLiteral(idx *index) error {
 	needle := []byte(s.pattern)
 
-	// Use all trigrams of the full phrase as a single filter.
-	// Unlike regex mode, '(' ')' '.' etc. are part of the phrase and contribute
-	// their boundary trigrams (e.g. "un(" "n()") — much more selective.
 	candidates := s.candidatesFromLiterals(idx, []string{s.pattern})
 
-	fmt.Fprintf(os.Stderr, "Candidates: %d / %d files\n", len(candidates), len(idx.files))
+	// Bloom pre-filter: eliminate candidates where the phrase's trigram→next-char
+	// class bits don't match — no disk reads needed for eliminated files.
+	before := len(candidates)
+	candidates = idx.bloomFilter(candidates, needle)
+	if len(idx.bloomData) > 0 {
+		fmt.Fprintf(os.Stderr, "Candidates: %d / %d files (bloom filtered %d)\n",
+			len(candidates), len(idx.files), before-len(candidates))
+	} else {
+		fmt.Fprintf(os.Stderr, "Candidates: %d / %d files\n", len(candidates), len(idx.files))
+	}
 
 	rootDir := s.rootDir
 	if rootDir == "" {
@@ -841,7 +1024,7 @@ func main() {
 	updateDir := updateFlags.String("dir", ".", "directory to index")
 	updateExts := updateFlags.String("ext", "cpp,h,java,py,go,rs,ts,js,c,cc,hpp,hh", "file extensions")
 	updateIgnore := updateFlags.String("ignore", "vendor,node_modules,target,build", "directory patterns to ignore")
-	updateMaxFreq := updateFlags.Float64("max-freq", 0.5, "prune threshold (inherits from existing index if not set)")
+	updateMaxFreq := updateFlags.Float64("max-freq", 0.5, "prune threshold")
 
 	searchFlags := flag.NewFlagSet("search", flag.ExitOnError)
 	searchIndex := searchFlags.String("index", ".claude/trigram-index.bin", "index file")
@@ -851,6 +1034,7 @@ func main() {
 	searchFilesOnly := searchFlags.Bool("files-only", false, "only print matching file paths")
 	searchContext := searchFlags.Int("context", 2, "lines of context")
 	searchRoot := searchFlags.String("root", ".", "root directory for resolving file paths")
+	searchMmap := searchFlags.Bool("mmap", false, "use mmap to load index (lower cold-start latency, avoids 44MB copy)")
 
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr, "Usage: trigrep <build|update|search> [options]")
@@ -897,6 +1081,7 @@ func main() {
 			filesOnly: *searchFilesOnly,
 			context:   *searchContext,
 			rootDir:   *searchRoot,
+			useMmap:   *searchMmap,
 		}
 		if err := cmd.run(); err != nil {
 			fmt.Fprintln(os.Stderr, "Error:", err)
