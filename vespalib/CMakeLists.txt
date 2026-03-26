@@ -29,6 +29,8 @@ vespa_define_module(
     src/tests/btree/btree_store
     src/tests/btree/btree-scan-speed
     src/tests/btree/btree-stress
+    src/tests/ptrie
+    src/tests/ptrie/ptrie-bench
     src/tests/component
     src/tests/compress
     src/tests/compression
@@ -164,6 +166,7 @@ vespa_define_module(
     LIBS
     src/vespa/vespalib
     src/vespa/vespalib/btree
+    src/vespa/vespalib/ptrie
     src/vespa/vespalib/component
     src/vespa/vespalib/crypto
     src/vespa/vespalib/data
