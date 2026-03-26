@@ -21,6 +21,7 @@ vespa_add_library(searchlib_diskindex OBJECT
     fusion_input_index.cpp
     fusion_output_index.cpp
     indexbuilder.cpp
+    nlt_dictionary.cpp
     pagedict4file.cpp
     pagedict4randread.cpp
     wordnummapper.cpp

@@ -116,6 +116,7 @@ vespa_define_module(
     src/tests/spin_lock
     src/tests/stash
     src/tests/stllike
+    src/tests/succinct
     src/tests/stringfmt
     src/tests/sync
     src/tests/testapp-debug
@@ -181,6 +182,7 @@ vespa_define_module(
     src/vespa/vespalib/process
     src/vespa/vespalib/regex
     src/vespa/vespalib/stllike
+    src/vespa/vespalib/succinct
     src/vespa/vespalib/test
     src/vespa/vespalib/testkit
     src/vespa/vespalib/text
