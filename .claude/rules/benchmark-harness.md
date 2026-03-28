@@ -9,11 +9,16 @@ paths:
   - "vespalib/src/vespa/vespalib/util/rcuvector*"
 ---
 
-# Benchmark Harness Specification
+# Evaluation Harness Specification
 
-When performing performance optimization on any component in searchlib, searchcore,
-storage, or their vespalib dependencies, ALL benchmarks must systematically cover the
-dimensions below. Do NOT write ad-hoc benchmarks that only test the "happy path" of
+This harness covers BOTH performance benchmarking AND correctness verification.
+Benchmarks without correctness are dangerous — a 2x faster merge is worthless if
+it silently drops documents. Correctness without benchmarks is incomplete — a
+100% correct merge that takes 10x longer causes operational incidents.
+
+When performing optimization or modification on any component in searchlib, searchcore,
+storage, or their vespalib dependencies, evaluations must systematically cover the
+dimensions below. Do NOT write ad-hoc tests that only cover the "happy path" of
 the current change.
 
 ## Pre-Optimization Checklist
@@ -117,7 +122,138 @@ All benchmark results MUST be reported in structured format:
 [... repeat for each applicable dimension ...]
 ```
 
-## Anti-Patterns to Avoid
+## Correctness Dimensions (mandatory for storage/feed/distribution changes)
+
+### C1: Operation Ordering and Consistency
+- Per-bucket operation sequencing: verify Put(ts=N) followed by Remove(ts=N+1) always results in removal
+- Concurrent Put + Remove on same document: verify highest timestamp wins
+- Concurrent Put + Update on same document: verify update applies to correct version
+- Test-and-set with racing operations: verify condition is evaluated atomically
+- Cross-document-type ordering: verify operations on different doc types in same bucket are independent
+
+### C2: Merge Correctness
+- Basic merge: N replicas with divergent content → all converge to same state
+- Source-only copy handling: verify source-only copies deleted only after successful merge
+- Source-only mutation detection: verify merge fails if source-only copy changes during merge
+- Partial chain failure: node N in chain fails mid-merge → verify chain unwinds correctly
+- Cluster state change during merge: verify outdated merges are aborted, not partially applied
+- Merge with concurrent feed: documents written during merge must not be lost
+- Merge throttler saturation: verify BUSY responses under queue overflow, verify recovery after drain
+- Unordered merge chaining: verify no deadlock when two nodes have full throttle windows
+- Rapid cluster state oscillation: state flips N times while merges in-flight → verify no stuck merges
+
+### C3: Split/Join Correctness
+- Split with concurrent feed: operations arriving during split() are remapped, not lost
+- Join with concurrent feed: same guarantee for join
+- Split then immediate join: verify round-trip preserves all documents
+- Bucket info consistency: after split/join, all replicas report consistent bucket info
+- Operation remapping ordering: verify remapped operations maintain per-document ordering
+
+### C4: Persistence and Recovery
+- Crash during flush: verify recovery replays TLS correctly, no data loss
+- Crash after TLS write but before memory index update: verify TLS replay rebuilds state
+- TLS serial number validation: verify `impossible` serials are detected (TLS < flushed = fatal)
+- Long offline node recovery: node offline for N hours, rejoins → verify data consistency
+- Recovery under load: node recovering while cluster is under write load
+- Partial flush recovery: flush wrote some files but not all → verify consistent state after restart
+
+### C5: Feed Path Correctness
+
+The feed path uses a NON-TRANSACTIONAL design: MetaStore is authoritative (sync on
+master thread), while doc store / attributes / index are async fire-and-forget with
+NO rollback. Durability relies on TLS replay, not operation-level atomicity.
+
+#### C5.1: FeedView Subsystem Consistency
+- After any sequence of Put/Update/Remove, verify ALL four subsystems agree:
+  MetaStore (GID→LID), DocumentStore (content), Attributes (field values), Index (searchable)
+- Test through each FeedView variant independently:
+  - StoreOnlyFeedView: MetaStore + DocumentStore only
+  - FastAccessFeedView: + Attributes (via IAttributeWriter on AttributeFieldWriter threads)
+  - SearchableFeedView: + Index (via IIndexWriter on Index thread)
+- Partial failure scenarios (no rollback exists):
+  - DocStore write fails → doc in MetaStore+Attributes+Index but content unretrievable
+  - Attribute write fails for one field → partial attribute state
+  - Index write fails → doc exists but not searchable
+  - Verify TLS replay recovers all these partial states to consistent
+
+#### C5.2: Threading and Ordering
+- Master thread: MetaStore updates (blocking, source of truth)
+- Summary thread: DocumentStore writes (async, parallel for different LIDs)
+- AttributeFieldWriter: per-attribute sequenced executor (parallel across attributes)
+- Index thread: single thread for all index operations (sequential)
+- Shared thread pool: document reconstruction during updates
+- Verify: `_pendingLidsForDocStore.waitComplete(lid)` prevents stale reads during update
+  (update reads doc from store before prior put completes → gets wrong base document)
+- Verify: rapid Put(lid=X) then Update(lid=X) → update applies to correct version
+- Verify: forceCommit coordination across all threads (attributes → summary → index)
+
+#### C5.3: DocumentMetaStore LID Management
+- LID allocation: verify no duplicate LIDs assigned under concurrent feed
+- LID recycling: `_lidReuseDelayer.delayReuse(lid)` → verify removed LID not reused
+  while readers still hold generation guard referencing it
+- LID compaction (LidSpaceCompactionJob): verify GID↔LID bijection maintained after
+  compaction moves documents from high→low LIDs
+- Verify: compaction under concurrent feed doesn't lose or duplicate documents
+
+#### C5.4: Update Path (the most complex operation)
+- Update reconstructs document: reads from DocStore → applies update → writes back
+- Verify: `waitComplete(lid)` prevents reading stale DocStore content
+- Verify: concurrent updates to same document produce correct final state
+- Verify: update with indexed + non-attribute fields triggers correct reconstruction
+  path (shared thread pool) and index path gets the reconstructed document via FutureDoc
+- Verify: test-and-set condition evaluated on master thread BEFORE async dispatch,
+  but concurrent Remove can execute between check and SPI dispatch
+
+#### C5.5: IndexMaintainer Lifecycle
+- Memory index → flush trigger → disk index → fusion
+- Verify no documents lost across transitions
+- Concurrent feed + flush: new operations must go to NEW memory index after switch,
+  not the one being flushed
+- Concurrent feed + fusion: operations during fusion go to current memory index,
+  fusion only merges completed disk indexes
+- Index switch atomicity: the swap from old IndexCollection to new must be atomic
+  from readers' perspective (no partial view with some disk indexes missing)
+- Verify: queries during flush/fusion see all documents (union of memory + disk indexes)
+
+#### C5.6: Attribute Consistency
+- Attribute values must match document store after any operation sequence
+- Per-attribute parallelism: different attributes updated on different threads
+- Verify: all attributes for one document reflect the same operation (not a mix of
+  old and new values from concurrent updates)
+- Struct field attributes: updated via reconstructed document, not direct update
+- Verify: enum store consistency after rapid updates to same string/enum attribute
+
+### C6: Distributed Correctness
+- Replica divergence detection: after N operations with failures, verify all replicas
+  converge after merge completes
+- Bucket distribution after state change: verify all documents accessible after
+  adding/removing nodes
+- Global bucket consistency: global buckets must maintain consistency across
+  all distributors
+- Throttler back-pressure recovery: after back-pressure period ends, verify
+  merges resume normally
+
+## Correctness Test Output Format
+
+```
+## Correctness Results: [component] - [change description]
+
+### C1: Operation Ordering
+| Scenario | Result | Evidence |
+|----------|--------|----------|
+| Concurrent Put+Remove same doc | PASS/FAIL | [description] |
+| Test-and-set with racing ops | PASS/FAIL | [description] |
+
+### C2: Merge Correctness
+| Scenario | Result | Evidence |
+|----------|--------|----------|
+| Partial chain failure unwind | PASS/FAIL | [description] |
+| Source-only mutation detection | PASS/FAIL | [description] |
+
+[... repeat for each applicable dimension ...]
+```
+
+## Performance Anti-Patterns to Avoid
 
 - Writing a benchmark that only tests insert but not lookup (or vice versa)
 - Benchmarking only at one scale
@@ -127,3 +263,14 @@ All benchmark results MUST be reported in structured format:
 - Ignoring memory footprint when optimizing for speed
 - Not establishing a baseline before making changes
 - Benchmarking in isolation without concurrent access patterns
+
+## Correctness Anti-Patterns to Avoid
+
+- Testing only the success path without failure injection
+- Testing merge without concurrent feed operations
+- Testing split/join without verifying document counts before and after
+- Assuming per-bucket ordering implies global ordering
+- Testing persistence without crash/recovery scenarios
+- Testing feed path through only one FeedView variant (must test all three)
+- Ignoring the TLS async write window when claiming durability
+- Testing IndexMaintainer transitions without concurrent operations
