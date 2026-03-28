@@ -141,6 +141,10 @@ All benchmark results MUST be reported in structured format:
 - Merge throttler saturation: verify BUSY responses under queue overflow, verify recovery after drain
 - Unordered merge chaining: verify no deadlock when two nodes have full throttle windows
 - Rapid cluster state oscillation: state flips N times while merges in-flight → verify no stuck merges
+- **Known code gap**: MergeThrottler broken cycle detection + dual-reply unwinding
+  (`mergethrottler.cpp:1025-1040`) lacks integration test
+- **Known code gap**: Unordered merge queue deadlock prevention logic
+  (`mergethrottler.cpp:718-736`) not tested
 
 ### C3: Split/Join Correctness
 - Split with concurrent feed: operations arriving during split() are remapped, not lost
@@ -156,6 +160,12 @@ All benchmark results MUST be reported in structured format:
 - Long offline node recovery: node offline for N hours, rejoins → verify data consistency
 - Recovery under load: node recovering while cluster is under write load
 - Partial flush recovery: flush wrote some files but not all → verify consistent state after restart
+- **Known code gap**: Long-offline node GC fires BEFORE merge completes
+  (`garbagecollectionoperation.cpp:70-78`) — GC can prune stale data on recovering node
+  before merge copies newer data from other replicas. If recovering node was only replica,
+  data is permanently lost with no warning. No safeguard exists.
+- **Known code gap**: State preemption during recovery is untested
+  (`stripe_bucket_db_updater.cpp:292` — explicit TODO in code)
 
 ### C5: Feed Path Correctness
 
@@ -224,6 +234,27 @@ NO rollback. Durability relies on TLS replay, not operation-level atomicity.
 - Verify: enum store consistency after rapid updates to same string/enum attribute
 
 ### C6: Distributed Correctness
+
+#### C6.1: Cluster State Transitions
+- State change propagation: verify all stripes updated atomically (park → update → unpark)
+- Rapid state transitions: V1 pending → V2 arrives before V1 completes → verify no data corruption
+- Bucket ownership transfer: verify all non-owned buckets cleared, all owned buckets present
+- **Known code gap**: Timestamp generation non-atomic across stripes during state transition
+  (`top_level_bucket_db_updater.cpp:263` — FIXME in code). Stripes generate timestamps
+  independently, can cause bucket metadata inconsistencies.
+- **Known code gap**: Config downsize race — config removing nodes arrives before matching
+  cluster state (`top_level_bucket_db_updater_test.cpp:2121` — test DISABLED)
+
+#### C6.2: Stripe Coordination
+- Park/unpark mechanism: verify no ABA problem in back-to-back park→unpark→park
+  (mitigated in `distributor_stripe_pool.cpp:60-67` but adds latency)
+- Stripe hang detection: verify system detects when a stripe is stuck in tick()
+  and never reaches park point (currently unmonitored)
+- Event notification: verify no lost notifications due to race between
+  `notify_event_has_triggered()` and `wait_until_event_notified_or_timed_out()`
+  (`distributor_stripe_thread.cpp:77` — TODO in code, no mutex protection)
+
+#### C6.3: Replica Convergence
 - Replica divergence detection: after N operations with failures, verify all replicas
   converge after merge completes
 - Bucket distribution after state change: verify all documents accessible after
@@ -232,6 +263,10 @@ NO rollback. Durability relies on TLS replay, not operation-level atomicity.
   all distributors
 - Throttler back-pressure recovery: after back-pressure period ends, verify
   merges resume normally
+- Stale reads with deferred activation: verify client sees consistent view during
+  transition between mutable and read-only bucket databases
+- OutdatedNodes inheritance: if node was marked outdated in State-V1 but never replied,
+  verify State-V2 doesn't merge V1's stale RequestBucketInfoReply into V2's database
 
 ## Correctness Test Output Format
 
