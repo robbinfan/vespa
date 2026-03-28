@@ -288,6 +288,66 @@ NO rollback. Durability relies on TLS replay, not operation-level atomicity.
 [... repeat for each applicable dimension ...]
 ```
 
+## Query Path Dimensions (mandatory for matching/ranking/summary changes)
+
+### Q1: Blueprint and Iterator Correctness
+- Blueprint::optimize() tree rewriting: verify result set is identical before and after optimization
+- Strict vs non-strict propagation: verify inheritStrict() for each IntermediateBlueprint
+  type returns correct strictness for each child position:
+  - AND: child 0 strict, others non-strict (sorted by estimate, cheapest first)
+  - OR: all children inherit parent's strictness
+  - ANDNOT: child 0 strict, negation children non-strict
+  - RANK: child 0 strict, ranking children non-strict
+  - NEAR/ONEAR: child 0 strict only
+  - WeakAnd: all children strict
+  - SourceBlender: all children strict
+- Filter optimization: createFilterSearch() must be UPPER_BOUND (superset of real matches)
+  or LOWER_BOUND (subset). Verify filter results are consistent with full evaluation.
+- OptimizedAndNotForBlackListing: uses doSeek() directly (bypasses bounds check).
+  Verify initRange() is always called before seekFast() — otherwise out-of-bounds access.
+- SourceBlenderSearch: verify all documents routable via SourceSelector after
+  IndexMaintainer flush/fusion transitions (no "orphaned" documents in wrong source)
+
+### Q2: Two-Phase Ranking Correctness
+- Phase 1 (match threads): all matching documents get first-phase score
+- Phase 2 (re-rank): only top-K get second-phase score, verify K is correct
+- Rendezvous barriers: verify GetSecondPhaseWork correctly selects global top-K
+  from per-thread heaps (not just top-K of thread 0)
+- Rank drop limit: documents below threshold are excluded from results — verify
+  threshold doesn't accidentally exclude documents that would rank high in phase 2
+- Score consistency: verify NaN/Inf handling (should map to -HUGE_VAL, not corrupt heap)
+- Match limiter: verify estimate_match_frequency() doesn't cause premature termination
+  that changes result set (limiter is approximation — verify it doesn't miss top hits)
+- Soft doom (timeout): verify partial results have correct coverage reporting
+  (don't claim 100% coverage if scan was truncated)
+
+### Q3: Summary and Feature Consistency
+- Summary features are computed via DocsumMatcher which RE-EXECUTES the query
+  for selected documents. Verify summary feature values match phase-2 values.
+- Document content from DocumentStore must be consistent with what was indexed:
+  after feed+flush cycle, summary content must match last write
+  (THIS IS THE StoreOnlyFeedView BUG CLASS: update modifies attribute/index but
+  docstore gets stale content → summary returns wrong field values)
+- Attribute values in summary must reflect latest committed state, not in-flight updates
+
+### Q4: Multi-Thread Query Correctness
+- DocidRangeScheduler: verify document ranges are non-overlapping and cover full space
+  (AdaptiveScheduler uses work-stealing — verify no double-counting)
+- DualMergeDirector: binary merge tree — verify no hits lost during merge
+- Per-thread HitCollector: three-tier (heap + docid vector + bitvector) — verify
+  tier transitions don't lose documents
+- Concurrent query + feed: query during flush/fusion must see union of all indexes
+  (memory + flushing + disk), never a partial view
+
+### Q5: Query Performance
+- Match thread scalability: throughput vs thread count (1, 2, 4, 8, 16 threads)
+- Blueprint optimize() overhead: time spent in tree rewriting vs actual matching
+- Strict vs non-strict: measure impact of strict propagation changes on throughput
+- Filter optimization: measure cost of createFilterSearch() vs full evaluation
+- Phase 2 overhead: re-ranking cost vs phase 1 cost at varying top-K sizes
+- Summary fetch latency: per-hit cost including DocumentStore read + feature re-computation
+- SourceBlender overhead: cost of selector lookup per document
+
 ## Performance Anti-Patterns to Avoid
 
 - Writing a benchmark that only tests insert but not lookup (or vice versa)
@@ -309,3 +369,10 @@ NO rollback. Durability relies on TLS replay, not operation-level atomicity.
 - Testing feed path through only one FeedView variant (must test all three)
 - Ignoring the TLS async write window when claiming durability
 - Testing IndexMaintainer transitions without concurrent operations
+- Modifying FeedView without verifying DocumentStore content matches after update
+  (the StoreOnlyFeedView bug: index/attributes updated but docstore gets stale content)
+- Changing Blueprint optimize() without verifying result set equivalence pre/post optimization
+- Testing query evaluation with single-source index only (must test SourceBlender across
+  memory + multiple disk indexes, especially during/after flush and fusion)
+- Modifying ranking without verifying summary features match phase-2 features
+  (DocsumMatcher re-executes the query — different code path than match thread)

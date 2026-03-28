@@ -61,7 +61,39 @@ ClusterState change → TopLevelDistributor
           → Persistence layer (actual data merge)
 ```
 
-**CRITICAL**: Changes to any component in one pipeline often affect the other.
+### Horizontal: Query Pipeline (read path)
+```
+Client → MatchEngine (async ThreadStackExecutor dispatch)
+  → SearchHandlerProxy (DocumentDB lookup by doc type)
+    → Matcher (creates MatchToolsFactory with Blueprint tree)
+      → MatchMaster (creates N MatchThreads + DocidRangeScheduler)
+        → Phase 1: each MatchThread in parallel:
+          ├── Blueprint::optimize() → tree rewriting for efficiency
+          ├── Blueprint::createSearch(strict) → SearchIterator tree
+          │   ├── SourceBlenderSearch (routes docid → correct index via SourceSelector)
+          │   ├── AND/OR/ANDNOT/WAND/NEAR iterators (strict/non-strict composition)
+          │   └── Leaf iterators: posting list, attribute, bitvector
+          ├── inner_match_loop: seek → unpack → rank (32 template specializations)
+          ├── HitCollector: heap of top-K per thread (3-tier: heap + docid + bitvector)
+          └── MatchLimiter: prunes query tree if too many matches
+        → Sync barrier: EstimateMatchFrequency (Rendezvous)
+        → Phase 2 (if enabled):
+          ├── Sync: GetSecondPhaseWork — thread 0 merges all heaps, selects global top-K
+          ├── DocumentScorer: re-rank assigned docs with expensive features
+          └── Sync: CompleteSecondPhase — merge re-ranked scores
+        → DualMergeDirector: binary merge tree across all threads
+      → ResultProcessor: sort, group, pagination
+    → SearchReply with top-N hits + coverage
+
+  Summary fetch (separate RPC, after hit selection):
+  → SummaryEngine (async ThreadStackExecutor)
+    → DocsumContext:
+      ├── DocumentStore.get(docid) — retrieve stored document
+      ├── DocsumMatcher.get_summary_features() — RE-EXECUTE query for selected docs
+      └── DocsumWriter.generateReply()
+```
+
+**CRITICAL**: Changes to any component in one pipeline often affect the others.
 E.g., optimizing MemoryIndex insert speed increases flush frequency, which
 affects IndexMaintainer fusion scheduling, which affects query latency.
 
@@ -298,11 +330,12 @@ To CHANGE a variable: hold ALL applicable locks. To READ: holding ANY one is suf
 1. **Identify the layer** you're optimizing (vertical AND horizontal position)
 2. **Read one layer down** to understand what you depend on
 3. **Read one layer up** to understand who depends on you
-4. **For feed path changes**: also check horizontal neighbors (e.g., FeedView → IndexMaintainer)
-5. **Benchmark at your layer** with standard dimensions (see benchmark-harness.md)
-6. **Run correctness checks** for the applicable C-dimensions (see benchmark-harness.md C1-C6)
-7. **Benchmark one layer up** to verify no upstream regression
-8. **Check layer 0 (RCU)** if your change affects allocation/deallocation patterns
+4. **For feed path changes**: also check query path impact (e.g., docstore consistency affects summary)
+5. **For query path changes**: also check feed path impact (e.g., Blueprint changes affect index transitions)
+6. **Benchmark at your layer** with standard dimensions (see benchmark-harness.md D1-D9)
+7. **Run correctness checks** for applicable dimensions (C1-C6 for feed, Q1-Q5 for query)
+8. **Benchmark one layer up** to verify no upstream regression
+9. **Check layer 0 (RCU)** if your change affects allocation/deallocation patterns
 
 ## Common Cross-Layer Pitfalls
 
@@ -320,3 +353,26 @@ To CHANGE a variable: hold ALL applicable locks. To READ: holding ANY one is suf
 | Faster merge execution | More aggressive redistribution → higher network/disk load on recovering nodes |
 | Reduced merge throttle window | Lower resource usage but slower convergence after node failure |
 | Optimized split/join | May trigger more frequent bucket rebalancing → more merge operations |
+| Changed Blueprint optimize() rules | May alter strict/non-strict propagation → different iterator tree → different perf profile |
+| Faster SourceBlenderSearch | Still limited by slowest source (disk index with cold cache) |
+| Modified UnpackInfo | Fewer unpacks → faster matching but ranking features may get stale/missing match data |
+| Changed match limiter threshold | More aggressive limiting → faster queries but potentially missing top hits |
+| Optimized HitCollector heap | Different tier transition behavior → verify no dropped hits at tier boundary |
+| Changed DocumentStore format | Affects BOTH feed path (write) AND query path (summary fetch) — must test both |
+| Modified attribute flush | Attribute values in summary may not reflect latest write if flush is delayed |
+
+## The StoreOnlyFeedView Lesson
+
+A real production incident: a change to StoreOnlyFeedView caused field updates to not
+flush to DocumentStore, while attributes and index were updated correctly. Result:
+- Query matching worked (index was correct)
+- Attribute-based ranking worked (attributes were correct)
+- But summary/document retrieval returned STALE field values (docstore was wrong)
+
+**This is the canonical example of why the harness must cross-check feed AND query paths.**
+
+The evaluator must verify:
+1. After Put/Update: DocumentStore content matches what was written
+2. After Update: ALL subsystems (MetaStore, DocStore, Attributes, Index) are consistent
+3. Summary features match ranking features for the same document
+4. End-to-end: write document → query it → fetch summary → verify all fields correct
