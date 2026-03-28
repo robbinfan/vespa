@@ -101,6 +101,38 @@ Before ANY code change:
 - Report results in the structured format from benchmark-harness.md
 - Explicitly call out any dimension that regressed, even if the primary target improved
 
+### Phase 4: Self-Audit (mandatory, every task, no exceptions)
+
+After Phase 3 completes — even if no one asks for a review — answer these questions:
+
+```
+## Self-Audit
+1. **Skipped dimensions**: Which mandatory dimensions did I skip? Why?
+   [list, or "none — all D1-D6 covered with evidence at [file:line]"]
+
+2. **Unverified assumptions**: Where did I assume something without testing?
+   [e.g., "assumed immutable → no concurrent test needed" — was this actually verified?]
+
+3. **Production crash scenario**: If this code goes to production and crashes,
+   what is the most likely cause?
+   [e.g., "data race on shared_ptr during concurrent read+rebuild"]
+
+4. **Harness blind spots**: Is there a failure mode that no current harness rule covers?
+   [If yes → propose a new rule with Origin tag, update benchmark-harness.md NOW]
+
+5. **Rule gaming**: Did I technically satisfy a rule while missing its intent?
+   [e.g., "D3: ran 2 threads but no actual contention" — this satisfies the letter but not the spirit]
+```
+
+Question 3 is the most important. If the answer describes a scenario that
+harness rules don't cover, that IS the next harness evolution.
+
+Question 5 prevents the harness from becoming a checkbox exercise.
+If the answer is "yes", tighten the rule immediately.
+
+> **Origin**: PR #1/2/3 retrospective — all bugs were in categories the harness
+> "covered" but not precisely enough to force CC to actually catch them.
+
 ## Feedback Density Metrics
 
 After each optimization task, evaluate execution quality:
