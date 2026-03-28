@@ -191,22 +191,39 @@ StoreOnlyFeedView (MetaStore + DocumentStore)
 
 #### 4b: IndexMaintainer (index lifecycle)
 
-**Architecture**: Manages memory→disk→fusion lifecycle.
+**Architecture**: Manages memory→disk→fusion lifecycle via three-lock hierarchy + optimistic retry.
 
 ```
 IndexMaintainer
   ├─ Current memory index (receiving live writes)
-  ├─ Flushing memory index (being written to disk, no new writes)
+  ├─ Frozen memory indexes (schema change caused extra indexes, flushed in order)
   ├─ N disk indexes (completed flushes, read-only)
   └─ Fusion (merging N disk indexes → 1, background)
 ```
 
+**Three-lock hierarchy** (documented in indexmaintainer.h:104-144):
+```
+_state_lock (SL)  ──┬── _index_update_lock (IUL)   writes need SL+IUL, reads need either
+                    └── _new_search_lock (NSL)      writes need SL+NSL, reads need either
+_fusion_lock (FL)                                   independent from above
+```
+To CHANGE a variable: hold ALL applicable locks. To READ: holding ANY one is sufficient.
+
 **What you must understand:**
-- Flush creates a NEW memory index, atomically swaps IndexCollection
-- Old memory index becomes read-only, flushed to disk in background
-- During flush: queries see union of (new memory index + flushing memory index + disk indexes)
-- Fusion only touches completed disk indexes, not the active memory index
-- IndexCollection swap is atomic via shared_ptr replacement
+- **Writes never block**: putDocument() takes IUL only, goes to current memory index.
+  Flush/fusion swap indexes under SL+IUL+NSL, so next write hits new index automatically.
+- **Queries never block**: getSourceCollection() takes NSL only (fast, low contention).
+  In-flight queries hold shared_ptr to old IndexCollection — stays alive until they finish.
+- **Flush is 3-phase**: initFlush (master thread, creates new memidx + swaps) →
+  doFlush (worker thread, serializes to disk) → doneFlush (master thread, replaces source).
+  If state changed between doFlush and doneFlush, worker **reloads disk index and retries**.
+- **Fusion has same retry pattern**: doneFusion checks ChangeGens, retries if schema changed.
+- **SourceSelector ID space**: limited to 256 sources. Fusion does clone-and-subtract to
+  rebase IDs (e.g., fusion of {1,2,3}→3, then subtract 3, so next flush is ID 1 again).
+- **Document visibility**: putDocument() updates SourceSelector + IndexCollection BEFORE
+  actual memory index insertion. Document is routable to correct source immediately.
+- **WarmupIndexCollection**: optionally wraps new disk index, routes queries to both old
+  and new indexes during warmup period to prime CPU caches.
 
 **Benchmark AND correctness requirements:**
 - Flush trigger latency: time from trigger to new memory index accepting writes
@@ -215,6 +232,11 @@ IndexMaintainer
 - Concurrent feed + fusion: documents not affected (fusion only on disk indexes)
 - Query coverage during transitions: verify queries see ALL documents at all times
 - Fusion throughput: entries/sec, I/O bandwidth, memory overhead
+- Retry overhead: measure cost when schema changes during flush/fusion (forced reload)
+- SourceSelector consistency: verify no document loses its source mapping after
+  clone-and-subtract during fusion
+- Frozen memory index ordering: verify extra frozen indexes (from schema changes)
+  are flushed before the "last" one
 
 #### 4c: Flush Engine
 
