@@ -32,6 +32,32 @@ Output a structured task brief:
 
 Do NOT proceed to implementation until this brief is reviewed.
 
+### Phase 0.5: Replacement Target Analysis (when task is "replace X with Y")
+
+When the task involves replacing an existing component, you MUST analyze the existing
+implementation BEFORE designing the replacement. Read the actual code, don't work from
+assumptions or simplified mental models.
+
+Output:
+
+```
+## Replacement Target Analysis: [component being replaced]
+- **Architecture**: [core data structures, file layout, access patterns]
+- **I/O model**: [number of files, mmap strategy, cache behavior, access sequence]
+- **Interface contracts**: [how upstream/downstream code calls it, invariants relied upon]
+- **Known bottlenecks**: [why it's being replaced — with evidence from code/profiling]
+- **Design tradeoffs**: [what the original design optimized FOR and AGAINST]
+```
+
+This analysis constrains the benchmark:
+- **Baseline must use the REAL existing component**, not a simulation. If the real
+  component cannot be benchmarked directly, explicitly document the simulation's
+  limitations and which behaviors are NOT modeled.
+- **All access patterns of the original must be covered**: if the original supports
+  5 operations, the benchmark must compare all 5, not just the one you expect to win.
+- **Interface equivalence must be verified**: the replacement must satisfy the same
+  contracts (e.g., same DictionaryFileRandRead interface, same ordering guarantees).
+
 ### Phase 1: Baseline Measurement
 
 Before ANY code change:
@@ -93,7 +119,15 @@ Writing the optimization first, then writing a benchmark to prove it works.
 **Fix**: Phase 1 — baseline measurement FIRST. The benchmark proves the problem exists
 before you write any optimization code.
 
-### 5. "Ignoring the Lifecycle"
+### 5. "Strawman Baseline"
+Replacing component X with Y, but benchmarking Y against a simplified simulation of X
+instead of the real implementation. The simulation omits critical behaviors (e.g., 3-file
+mmap, LCP compression, cache line distribution) so the comparison is misleading.
+
+**Fix**: Phase 0.5 — analyze the real component. Benchmark against it directly, or
+explicitly document every simplification and its impact on results.
+
+### 6. "Ignoring the Lifecycle"
 Showing great memory index numbers but not testing what happens at flush time,
 or how fusion performance changes.
 
@@ -113,5 +147,7 @@ Before declaring an optimization task complete, answer these questions:
 - [ ] Did I check one dependency layer down for new bottlenecks?
 - [ ] Are my results in the structured format from benchmark-harness.md?
 - [ ] Can someone reproduce my results with the benchmark code I provided?
+- [ ] If replacing a component: did I read its actual code first (Phase 0.5)?
+- [ ] If replacing: is my baseline the real component, not a simplified simulation?
 
 If any answer is "no", the task is not complete.
