@@ -46,11 +46,39 @@ Before writing any optimization code:
 - For datastore: buffer utilization, dead space ratio
 
 ### D3: Concurrent Mixed Read/Write
+
+#### D3a: Concurrent Performance
 - Test configurations: 1W+4R, 2W+8R, 4W+16R (W=writers, R=readers)
 - Report throughput AND latency percentiles: p50, p95, p99, p999
 - Measure reader throughput degradation under write load
 - Measure writer throughput degradation under read load
 - For RCU-based structures: generation hold list growth under contention
+
+#### D3b: Concurrent Correctness (mandatory for any shared mutable state)
+- ALL concurrent tests MUST be run under ThreadSanitizer (`-fsanitize=thread`).
+  TSan deterministically detects data races; probabilistic stress tests are insufficient.
+- For new or modified concurrent data structures (Layer 0/1/2), output a
+  **Concurrency Safety Proof** before writing benchmark code:
+
+```
+## Concurrency Safety Proof: [component]
+- **Reader paths**: [every function that reads shared state, e.g., find(), getFrozenView()]
+- **Writer paths**: [every function that writes shared state, e.g., insert(), compact()]
+- **Shared mutable state**: [each variable, with protection mechanism]
+  - _root: atomic<uint32_t>, load(acquire)/store(release)
+  - _arena._data: [protection? resize safety?]
+  - ...
+- **Pointer/reference lifetime**: [for each pointer held by readers, what guarantees validity?]
+  - FrozenView holds NodeArena*: [safe if arena never reallocates/swaps during reader lifetime]
+  - ...
+- **Removed safety mechanisms**: [what from the old design was removed, and why not needed]
+  - Removed GenerationHandler guard: [because... or NOT safe because...]
+```
+
+If you cannot complete this proof, the code must NOT claim "lock-free" or "thread-safe".
+
+> **Origin**: PR #1 (shared_ptr race), PR #3 (compact() use-after-free, find() torn reads).
+> All three bugs were invisible to performance benchmarks but would crash in production.
 
 ### D4: Full Lifecycle (not just memory-resident)
 - Memory index: insert → flush to disk → read back → fusion with existing disk index
@@ -376,3 +404,56 @@ NO rollback. Durability relies on TLS replay, not operation-level atomicity.
   memory + multiple disk indexes, especially during/after flush and fusion)
 - Modifying ranking without verifying summary features match phase-2 features
   (DocsumMatcher re-executes the query — different code path than match thread)
+- Claiming "lock-free" or "thread-safe" without a Concurrency Safety Proof (D3b)
+- Running concurrent benchmarks without TSan (`-fsanitize=thread`)
+- Removing an existing safety mechanism (GenerationHandler, mutex, etc.) without
+  proving the replacement provides equivalent guarantees
+
+## Harness Evolution Protocol
+
+This harness is NOT a static document. It evolves through a structured feedback loop.
+
+### When to evolve
+
+After every `/optimization-review` or PR retrospective, check:
+1. Did the review find issues that NO existing dimension/rule would have caught?
+2. Did the review find issues that an existing rule SHOULD have caught but didn't
+   (rule was too vague, too narrow, or poorly structured)?
+
+If yes to either, the harness must be updated in the same commit/PR as the review.
+
+### How to evolve
+
+Each new rule or dimension change must include an **Origin tag**:
+
+```
+> **Origin**: PR #N — [one-sentence description of what went wrong]
+```
+
+This serves three purposes:
+1. **Traceability**: every rule has a concrete motivation, not abstract "best practice"
+2. **Validation**: future readers can check if the rule would actually have caught the original issue
+3. **Pruning**: if the origin PR turns out to be irrelevant, the rule can be reconsidered
+
+### Evolution anti-patterns
+
+- **"Kitchen sink"**: adding rules for theoretical issues that have never occurred.
+  Every rule must have an Origin tag pointing to a real incident or near-miss.
+- **"Frozen harness"**: treating the harness as complete and never updating it.
+  If 3 consecutive retrospectives find zero new issues, the harness may be overfitting
+  to past problems — actively look for blind spots.
+- **"Rule bloat"**: adding rules without consolidation. When the harness exceeds ~500 lines,
+  review for overlapping or redundant rules. Merge where possible.
+- **"Specificity trap"**: adding a rule so specific it only catches one exact bug pattern.
+  Generalize: "shared_ptr race on histogram" → "D3b: all shared mutable state needs
+  TSan + safety proof".
+
+### Current evolution history
+
+| Date | Change | Origin |
+|------|--------|--------|
+| 2026-03-28 | Added D3b (TSan + Concurrency Safety Proof) | PR #1 shared_ptr race, PR #3 compact() UAF |
+| 2026-03-28 | Added Phase 0.5 (Replacement Target Analysis) | PR #2 strawman PD4 simulation, PR #1/3 missing dep analysis |
+| 2026-03-28 | Added Exploration/Production mode | PR #1/2/3 all exploration-quality with production-level bugs |
+| 2026-03-28 | Added "Strawman Baseline" anti-pattern | PR #2 simulated PD4 instead of real baseline |
+| 2026-03-28 | Added Harness Evolution Protocol | Meta: harness itself needs a feedback loop |

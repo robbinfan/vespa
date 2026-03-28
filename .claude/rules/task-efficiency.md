@@ -14,6 +14,26 @@ paths:
 Track how effectively optimization tasks are executed. Detect wasted iterations,
 missed dimensions, and detours early — not after 5 rounds of review feedback.
 
+## Task Mode
+
+Every task must declare its mode upfront. The mode determines which dimensions are mandatory.
+
+**Exploration mode** — "is this direction worth pursuing?"
+- Required: D1 + D2 + D6 (enough to judge if the approach is viable)
+- Recommended: D3a, D5 (catch obvious issues early)
+- Output clearly marked `[EXPLORATION]` — results are directional, not production-ready
+
+**Production mode** — "this will be merged and deployed"
+- Required: ALL of D1-D9 (as applicable) + C1-C6 + Q1-Q5
+- D3b (TSan + Concurrency Safety Proof) mandatory for any concurrent code
+- Phase 0.5 mandatory for replacement tasks
+
+**Mode transition**: When an exploration PR is promoted to production, a full
+re-evaluation is required. Do NOT assume exploration benchmarks are sufficient.
+
+> **Origin**: PR #1/2/3 were all exploration-quality but had production-level bugs
+> that only a full evaluation would have caught.
+
 ## Task Execution Protocol
 
 ### Phase 0: Scope Understanding (BEFORE any code)
@@ -22,6 +42,7 @@ Output a structured task brief:
 
 ```
 ## Task Brief
+- **Mode**: [Exploration | Production]
 - **Goal**: [one sentence - what we're optimizing and why]
 - **Target component**: [exact files/classes]
 - **Dependency chain**: [which layers are involved, per dependency-aware-optimization.md]

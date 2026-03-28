@@ -109,11 +109,34 @@ Analyze the commit history and code evolution:
 - [any dimensions or scenarios not covered by current harness spec that SHOULD be added]
 ```
 
-### Step 6: Update harness rules if needed
+### Step 6: Harness Evolution (mandatory)
 
-If the retrospective reveals gaps in the harness spec itself (new dimensions,
-new cross-layer pitfalls), propose additions to:
-- `.claude/rules/benchmark-harness.md`
-- `.claude/rules/dependency-aware-optimization.md`
+Every retrospective MUST evaluate the harness itself. This is not optional.
 
-This makes the harness a living document that improves with each optimization cycle.
+```
+## Harness Evolution Check
+
+### Issues found that existing rules SHOULD have caught:
+| Issue | Relevant rule | Why it wasn't caught |
+|-------|--------------|---------------------|
+| [e.g., shared_ptr race] | D3 concurrent testing | D3 only required performance, not TSan/correctness |
+
+### Issues found that NO existing rule covers:
+| Issue | Proposed new rule | Generalized pattern |
+|-------|------------------|-------------------|
+| [e.g., compact() UAF] | D3b: Concurrency Safety Proof | Any removal of safety mechanism needs proof of equivalence |
+
+### Action: Update harness files
+```
+
+If new rules are needed:
+1. Add them to the relevant `.claude/rules/*.md` file
+2. Include an `> **Origin**: PR #N — ...` tag on each new rule
+3. Update the evolution history table in `benchmark-harness.md`
+4. Commit harness changes in the SAME PR as the retrospective
+
+If no new rules are needed, explicitly state why:
+- "All issues were covered by existing rules that were simply not followed" → no harness change needed, but note which rules were skipped
+- "No new issue patterns found" → harness is adequate for this type of task
+
+**The harness evolves by accretion from real incidents, not from speculation.**
