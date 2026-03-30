@@ -45,11 +45,18 @@ Output a structured task brief:
 - **Mode**: [Exploration | Production]
 - **Goal**: [one sentence - what we're optimizing and why]
 - **Target component**: [exact files/classes]
+- **Testability level**: [A/B/C/D/E — from D0 assessment in benchmark-harness.md]
 - **Dependency chain**: [which layers are involved, per dependency-aware-optimization.md]
 - **Success criteria**: [concrete, measurable - e.g., "2x lookup throughput at p99"]
-- **Benchmark dimensions**: [list which D1-D9 from benchmark-harness.md apply]
+- **Benchmark dimensions**: [list which D1-D9 apply, and which are BLOCKED by testability level]
 - **Risk assessment**: [what could go wrong, what upstream/downstream effects to watch]
 ```
+
+If testability level is C/D/E:
+- List which dimensions are unreachable and why
+- For level E: STOP — testability improvement is the task, not optimization
+- For level C/D: decide whether to (a) proceed with partial coverage and document
+  risk assumptions, or (b) invest in testability first
 
 Do NOT proceed to implementation until this brief is reviewed.
 
@@ -190,6 +197,8 @@ or how fusion performance changes.
 
 Before declaring an optimization task complete, answer these questions:
 
+- [ ] Did I assess testability (D0) before planning benchmarks?
+- [ ] If testability is C/D/E: did I document which dimensions are blocked and why?
 - [ ] Did I establish a baseline BEFORE changing any code?
 - [ ] Did I cover all mandatory dimensions (D1-D6)?
 - [ ] Did I test with multiple data distributions (not just uniform random)?

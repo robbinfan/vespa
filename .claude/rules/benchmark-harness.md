@@ -29,6 +29,84 @@ Before writing any optimization code:
 3. Present the plan for review BEFORE implementing
 4. Establish baseline measurements with the EXISTING code first
 
+## D0: Testability Assessment (mandatory, BEFORE all other dimensions)
+
+Before planning any benchmark, assess whether the target component CAN be tested
+in isolation. This is the prerequisite for all other dimensions.
+
+### Testability Checklist
+
+```
+## Testability Assessment: [component]
+
+### 1. Instantiation
+- Can the component be constructed in a unit test? [yes/no]
+- Dependencies required: [list all, mark each as mockable/real-only]
+- If no: what is the minimum dependency set to make it runnable?
+
+### 2. Isolation Boundary
+- Can we test this component WITHOUT bringing up: [check all that apply]
+  - [ ] Network/MessageBus
+  - [ ] Cluster state machinery
+  - [ ] Persistence layer (disk)
+  - [ ] Thread pool / executor framework
+  - [ ] Other components in the same layer
+- Tightest isolation achievable: [unit | component | integration | system]
+
+### 3. Observability
+- Can we measure the target metric directly? [yes/no]
+- If no: what proxy metric, and how accurate is it?
+- Can we inject controlled inputs? [yes/no]
+- Can we observe internal state for correctness checks? [yes/no]
+
+### 4. Existing Test Infrastructure
+- Existing tests: [list test files, what they cover]
+- Existing benchmarks: [list, what dimensions they cover]
+- Test gaps: [what's NOT tested today]
+
+### 5. Testability Verdict
+- **Level**: [A: fully testable in isolation | B: testable with mocks/stubs |
+             C: requires integration setup | D: requires system-level test |
+             E: not testable without infrastructure changes]
+- **Blocker** (if C/D/E): [what prevents isolation]
+- **Mitigation**: [how to make it testable, or what dimensions must be deferred]
+```
+
+### Testability Levels and Harness Coverage
+
+| Level | What's possible | Harness coverage |
+|-------|----------------|-----------------|
+| A — Unit testable | All D1-D9, C1-C6 applicable | Full harness |
+| B — Mockable | D1-D6 with mocks; D3b requires real concurrency paths | Full minus D7-D9 |
+| C — Integration | D1, D2, D6 feasible; D3 needs careful setup | Partial — document gaps |
+| D — System-level | Only D1 (end-to-end throughput), D6 (scale) | Minimal — mostly manual |
+| E — Not testable | No dimensions achievable | **STOP**: testability improvement IS the task |
+
+### Rules
+
+1. **Level E is a blocker**: If a component scores Level E, do NOT proceed with
+   optimization. The first task is to make it testable (extract interface, add
+   test seam, create mock). This is not wasted work — it's a prerequisite.
+
+2. **Document what you CAN'T test**: For Level C/D, explicitly list which harness
+   dimensions are skipped and why. This is not a failure — it's honest scoping.
+   But it means those dimensions become **risk assumptions** that must be called
+   out in the PR description.
+
+3. **Mock fidelity matters**: If using mocks for Level B, document what the mock
+   does NOT model. A mock that returns constant-time responses won't catch
+   contention issues. A mock that skips serialization won't catch I/O bottlenecks.
+
+4. **Testability improvement is a valid deliverable**: Sometimes the highest-value
+   work is not "optimize X" but "make X testable so it CAN be optimized safely."
+   This is especially true for Level D/E components where untested optimizations
+   are just gambling.
+
+> **Origin**: Retrospective observation — harness assumes all components are
+> unit-testable (Level A), but many Vespa components (MergeThrottler, FeedView,
+> DistributorStripe) are Level C/D. Applying D1-D9 without acknowledging this
+> produces incomplete or misleading results.
+
 ## Mandatory Dimensions (all optimizations must cover these)
 
 ### D1: Single-Operation Throughput
@@ -457,3 +535,4 @@ This serves three purposes:
 | 2026-03-28 | Added Exploration/Production mode | PR #1/2/3 all exploration-quality with production-level bugs |
 | 2026-03-28 | Added "Strawman Baseline" anti-pattern | PR #2 simulated PD4 instead of real baseline |
 | 2026-03-28 | Added Harness Evolution Protocol | Meta: harness itself needs a feedback loop |
+| 2026-03-30 | Added D0 Testability Assessment | Meta: harness assumed all components are unit-testable |
