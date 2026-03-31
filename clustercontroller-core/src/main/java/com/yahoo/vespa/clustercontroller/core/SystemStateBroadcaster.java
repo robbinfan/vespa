@@ -12,6 +12,7 @@ import java.util.logging.Level;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
@@ -66,6 +67,14 @@ public class SystemStateBroadcaster {
 
     public ClusterStateBundle getLastClusterStateBundleConverged() {
         return lastClusterStateBundleConverged;
+    }
+
+    /**
+     * Remove error tracking state for nodes that are no longer configured,
+     * to prevent unbounded growth of lastErrorReported when nodes are frequently added and removed.
+     */
+    public void removeFromErrorTracking(Set<Node> configuredNodes) {
+        lastErrorReported.keySet().retainAll(configuredNodes);
     }
 
     private void reportNodeError(boolean nodeOk, NodeInfo info, String message) {

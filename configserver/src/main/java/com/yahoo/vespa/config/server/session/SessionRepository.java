@@ -350,6 +350,10 @@ public class SessionRepository {
         log.log(Level.FINE, () -> "Remote sessions for tenant " + tenantName + ": " + remoteSessionsFromZooKeeper);
 
         int deleted = 0;
+        // Use higher batch limit to keep up with high-frequency schema changes.
+        // With the maintainer running every 30s and a batch limit of 50, this allows
+        // cleaning up to ~6000 expired sessions per hour.
+        int maxDeletesPerRun = 50;
         for (long sessionId : remoteSessionsFromZooKeeper) {
             Session session = remoteSessionCache.get(sessionId);
             if (session == null) {
@@ -362,8 +366,7 @@ public class SessionRepository {
                 deleteRemoteSessionFromZooKeeper(session);
                 deleted++;
             }
-            // Avoid deleting too many in one run
-            if (deleted >= 2)
+            if (deleted >= maxDeletesPerRun)
                 break;
         }
         return deleted;

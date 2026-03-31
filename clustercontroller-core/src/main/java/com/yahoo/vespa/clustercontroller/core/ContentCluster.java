@@ -19,6 +19,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.stream.Collectors;
 
@@ -112,6 +113,12 @@ public class ContentCluster {
     /** Sets the configured nodes of this cluster */
     public final void setNodes(Collection<ConfiguredNode> configuredNodes) {
         clusterInfo.setNodes(configuredNodes, this, distribution);
+        // Clean up start timestamps for nodes that are no longer configured,
+        // to avoid unbounded growth when nodes are frequently added and removed
+        Set<Integer> configuredIndices = configuredNodes.stream()
+                .map(ConfiguredNode::index)
+                .collect(Collectors.toSet());
+        nodeStartTimestamps.keySet().removeIf(node -> !configuredIndices.contains(node.getIndex()));
     }
 
     public void setStartTimestamp(Node n, long startTimestamp) {
