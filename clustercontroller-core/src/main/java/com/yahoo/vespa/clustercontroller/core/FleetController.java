@@ -512,6 +512,11 @@ public class FleetController implements NodeStateOrHostInfoChangeHandler, NodeAd
         cluster.setPollingFrequency(options.statePollingFrequency);
         cluster.setDistribution(options.storageDistribution);
         cluster.setNodes(options.nodes);
+        // Clean up broadcaster state for nodes no longer in configuration
+        Set<Node> configuredNodes = cluster.clusterInfo().getAllNodeInfo().stream()
+                .map(NodeInfo::getNode)
+                .collect(Collectors.toSet());
+        systemStateBroadcaster.removeFromErrorTracking(configuredNodes);
         database.setZooKeeperAddress(options.zooKeeperServerAddress, databaseContext);
         database.setZooKeeperSessionTimeout(options.zooKeeperSessionTimeout, databaseContext);
         stateGatherer.setMaxSlobrokDisconnectGracePeriod(options.maxSlobrokDisconnectGracePeriod);
