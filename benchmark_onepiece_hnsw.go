@@ -6,7 +6,6 @@ import (
 	"math"
 	"math/rand"
 	"sort"
-	"sync"
 	"time"
 )
 
@@ -33,28 +32,19 @@ func (pq *MinPQ) Pop() interface{} {
 }
 
 // ============================================================================
-// Stats (thread-safe for parallel independent search)
+// Stats & Types
 // ============================================================================
 
 type SearchStats struct {
 	DistCalcs    int64
 	VecLoads     int64
 	NodesVisited int64
-	mu           sync.Mutex
 }
 
 func (s *SearchStats) Reset() {
 	s.DistCalcs = 0
 	s.VecLoads = 0
 	s.NodesVisited = 0
-}
-
-func (s *SearchStats) Add(other SearchStats) {
-	s.mu.Lock()
-	s.DistCalcs += other.DistCalcs
-	s.VecLoads += other.VecLoads
-	s.NodesVisited += other.NodesVisited
-	s.mu.Unlock()
 }
 
 type Neighbor struct {
@@ -88,74 +78,37 @@ func normalize(v []float32) {
 }
 
 // ============================================================================
-// Data Generation: OnePiece scenario
+// OnePiece Progressive Embedding Generation
 // ============================================================================
 
-// generateOnePieceData creates clustered item embeddings for e-commerce search.
-// Items cluster by category (electronics, clothing, food, etc.)
-func generateItemEmbeddings(rng *rand.Rand, numDocs, dim, numClusters int) ([][]float32, [][]float32) {
-	centers := make([][]float32, numClusters)
-	for c := 0; c < numClusters; c++ {
-		center := make([]float32, dim)
-		for j := range center {
-			center[j] = float32(rng.NormFloat64())
-		}
-		normalize(center)
-		centers[c] = center
+// generateOnePieceEmbeddings generates 6 progressive embeddings for a user.
+// Each step is a refinement of the previous -- same semantic direction,
+// progressively more precise. sigma controls inter-step noise.
+func generateOnePieceEmbeddings(rng *rand.Rand, baseCenter []float32, dim, nSteps int, stepSigma float32) [][]float32 {
+	embeddings := make([][]float32, nSteps)
+	// Start from base interest direction
+	current := make([]float32, dim)
+	copy(current, baseCenter)
+	// Add initial user-level noise
+	for j := range current {
+		current[j] += float32(rng.NormFloat64()) * 0.15
 	}
+	normalize(current)
 
-	// Power-law cluster sizes (some categories much larger)
-	vectors := make([][]float32, numDocs)
-	sigma := float32(0.15)
-	for i := 0; i < numDocs; i++ {
-		// Power-law: smaller cluster IDs get more items
-		clusterID := int(math.Abs(rng.NormFloat64()) * float64(numClusters) / 3.0)
-		if clusterID >= numClusters {
-			clusterID = rng.Intn(numClusters)
+	for s := 0; s < nSteps; s++ {
+		emb := make([]float32, dim)
+		copy(emb, current)
+		// Each step adds small refinement noise (decreasing with step)
+		noise := stepSigma / float32(1+s) // later steps = smaller perturbation
+		for j := range emb {
+			emb[j] += float32(rng.NormFloat64()) * noise
 		}
-		center := centers[clusterID]
-		vec := make([]float32, dim)
-		for j := range vec {
-			vec[j] = center[j] + float32(rng.NormFloat64())*sigma
-		}
-		normalize(vec)
-		vectors[i] = vec
+		normalize(emb)
+		embeddings[s] = emb
+		// Progressive refinement: next step starts from current output
+		copy(current, emb)
 	}
-	return vectors, centers
-}
-
-// generateOnePieceQueries creates progressive refinement embeddings for one user.
-// OnePiece produces N embeddings through iterative reasoning steps:
-//   step 1: coarsest (general user intent)
-//   step N: finest (purchase-level specificity)
-// All embeddings are semantically similar → high spatial clustering.
-func generateOnePieceQueries(rng *rand.Rand, centers [][]float32, dim, numSteps int) [][]float32 {
-	// Pick a "user intent" cluster center
-	targetCluster := rng.Intn(len(centers))
-	baseCenter := centers[targetCluster]
-
-	// User's true intent (specific point near the cluster center)
-	userIntent := make([]float32, dim)
-	for j := range userIntent {
-		userIntent[j] = baseCenter[j] + float32(rng.NormFloat64())*0.10
-	}
-	normalize(userIntent)
-
-	// Progressive refinement: step 1 is noisier, step N is closer to true intent
-	queries := make([][]float32, numSteps)
-	for step := 0; step < numSteps; step++ {
-		// Noise decreases with each step: sigma = 0.20 * (1 - step/N)
-		progress := float64(step) / float64(numSteps-1) // 0.0 to 1.0
-		sigma := 0.20 * (1.0 - progress*0.8)            // 0.20 → 0.04
-
-		q := make([]float32, dim)
-		for j := range q {
-			q[j] = userIntent[j] + float32(rng.NormFloat64()*sigma)
-		}
-		normalize(q)
-		queries[step] = q
-	}
-	return queries
+	return embeddings
 }
 
 // ============================================================================
@@ -163,16 +116,41 @@ func generateOnePieceQueries(rng *rand.Rand, centers [][]float32, dim, numSteps 
 // ============================================================================
 
 type HnswIndex struct {
-	Dim   int
-	M     int
-	Vecs  [][]float32
-	Links [][]int
-	N     int
-	Entry int
+	Dim      int
+	M        int
+	Vecs     [][]float32
+	Links    [][]int
+	N        int
+	Stats    SearchStats
+	Entry    int
+	counting bool
 }
 
 func NewHnswIndex(dim, m int) *HnswIndex {
 	return &HnswIndex{Dim: dim, M: m, Entry: -1}
+}
+
+func (h *HnswIndex) distToDoc(query []float32, docid int) float64 {
+	if h.counting {
+		h.Stats.VecLoads++
+		h.Stats.DistCalcs++
+	}
+	return ipDist(query, h.Vecs[docid])
+}
+
+func (h *HnswIndex) distToDocBatch(queries [][]float32, docid int) []float64 {
+	if h.counting {
+		h.Stats.VecLoads++
+	}
+	doc := h.Vecs[docid]
+	dists := make([]float64, len(queries))
+	for qi, q := range queries {
+		if h.counting {
+			h.Stats.DistCalcs++
+		}
+		dists[qi] = ipDist(q, doc)
+	}
+	return dists
 }
 
 func (h *HnswIndex) BuildNSW(vectors [][]float32) {
@@ -266,22 +244,20 @@ func (h *HnswIndex) BuildNSW(vectors [][]float32) {
 }
 
 // ============================================================================
-// Search Methods (with stats tracking)
+// Search Methods
 // ============================================================================
 
-func (h *HnswIndex) SearchSingle(query []float32, k, ef int, stats *SearchStats) []Neighbor {
-	ep := h.Entry
-	epDist := ipDist(query, h.Vecs[ep])
-	stats.VecLoads++
-	stats.DistCalcs++
+func (h *HnswIndex) SearchSingle(query []float32, k, ef int) []Neighbor {
+	h.counting = true
+	defer func() { h.counting = false }()
 
+	ep := h.Entry
+	epDist := h.distToDoc(query, ep)
 	changed := true
 	for changed {
 		changed = false
 		for _, nb := range h.Links[ep] {
-			stats.VecLoads++
-			stats.DistCalcs++
-			d := ipDist(query, h.Vecs[nb])
+			d := h.distToDoc(query, nb)
 			if d < epDist {
 				ep = nb
 				epDist = d
@@ -300,13 +276,11 @@ func (h *HnswIndex) SearchSingle(query []float32, k, ef int, stats *SearchStats)
 		if len(best) >= ef && item.dist > best[ef-1].dist {
 			break
 		}
-		stats.NodesVisited++
+		h.Stats.NodesVisited++
 		for _, nb := range h.Links[item.docid] {
 			if !visited[nb] {
 				visited[nb] = true
-				stats.VecLoads++
-				stats.DistCalcs++
-				d := ipDist(query, h.Vecs[nb])
+				d := h.distToDoc(query, nb)
 				if len(best) < ef || d < best[len(best)-1].dist {
 					heap.Push(pq, PQItem{d, nb})
 					best = append(best, PQItem{d, nb})
@@ -329,22 +303,18 @@ func (h *HnswIndex) SearchSingle(query []float32, k, ef int, stats *SearchStats)
 	return result
 }
 
-func (h *HnswIndex) SearchBatch(queries [][]float32, k, ef int, stats *SearchStats) [][]Neighbor {
+func (h *HnswIndex) SearchBatch(queries [][]float32, k, ef int) [][]Neighbor {
+	h.counting = true
+	defer func() { h.counting = false }()
+
 	n := len(queries)
-
-	// Shared entry point descent
 	ep := h.Entry
-	stats.VecLoads++
-	stats.DistCalcs++
-	epDist := ipDist(queries[0], h.Vecs[ep])
-
+	epDist := h.distToDoc(queries[0], ep)
 	changed := true
 	for changed {
 		changed = false
 		for _, nb := range h.Links[ep] {
-			stats.VecLoads++
-			stats.DistCalcs++
-			d := ipDist(queries[0], h.Vecs[nb])
+			d := h.distToDoc(queries[0], nb)
 			if d < epDist {
 				ep = nb
 				epDist = d
@@ -359,8 +329,7 @@ func (h *HnswIndex) SearchBatch(queries [][]float32, k, ef int, stats *SearchSta
 		if qi == 0 {
 			d = epDist
 		} else {
-			stats.DistCalcs++
-			d = ipDist(queries[qi], h.Vecs[ep])
+			d = h.distToDoc(queries[qi], ep)
 		}
 		allBest[qi] = []PQItem{{d, ep}}
 	}
@@ -393,19 +362,16 @@ func (h *HnswIndex) SearchBatch(queries [][]float32, k, ef int, stats *SearchSta
 		if allLimitsMet && limitDists[0] < math.Inf(1) {
 			break
 		}
-		stats.NodesVisited++
+		h.Stats.NodesVisited++
 
 		for _, nb := range h.Links[item.docid] {
 			if !visited[nb] {
 				visited[nb] = true
-				// Batch: ONE vector load, N distance calcs
-				stats.VecLoads++
-				doc := h.Vecs[nb]
+				dists := h.distToDocBatch(queries, nb)
 				minD := math.Inf(1)
 				anyUseful := false
 				for qi := 0; qi < n; qi++ {
-					stats.DistCalcs++
-					d := ipDist(queries[qi], doc)
+					d := dists[qi]
 					if d < minD {
 						minD = d
 					}
@@ -444,134 +410,57 @@ func (h *HnswIndex) SearchBatch(queries [][]float32, k, ef int, stats *SearchSta
 	return results
 }
 
-// SearchDraftVerify: use early steps (coarse) for draft, late steps (fine) for verify.
-// This exploits OnePiece's progressive structure.
-func (h *HnswIndex) SearchDraftVerify(queries [][]float32, k, ef int, stats *SearchStats) [][]Neighbor {
-	n := len(queries)
-	draftEf := 30 // small ef for coarse draft
-
-	// DRAFT: use step 0 (coarsest) to quickly find candidate region
-	var draftStats SearchStats
-	draftResult := h.SearchSingle(queries[0], draftEf, draftEf, &draftStats)
-	stats.DistCalcs += draftStats.DistCalcs
-	stats.VecLoads += draftStats.VecLoads
-	stats.NodesVisited += draftStats.NodesVisited
-
-	seeds := make(map[int]bool, len(draftResult))
-	for _, nb := range draftResult {
-		seeds[nb.Docid] = true
+// SearchProgressive: OnePiece progressive retrieval
+// Phase 1: Batch HNSW search using early-step (coarse) embeddings
+// Phase 2: Brute-force re-rank candidates using later-step (fine) embeddings
+func (h *HnswIndex) SearchProgressive(allStepEmbeddings [][]float32, k, ef, draftSteps int) [][]Neighbor {
+	nSteps := len(allStepEmbeddings)
+	if draftSteps >= nSteps {
+		draftSteps = nSteps
 	}
 
-	// VERIFY: from seeds, do batch search with all N embeddings at full ef
-	allBest := make([][]PQItem, n)
-	for qi := 0; qi < n; qi++ {
-		allBest[qi] = make([]PQItem, 0, len(seeds))
-		for docid := range seeds {
-			stats.VecLoads++ // loading for initial seed evaluation
-			stats.DistCalcs++
-			d := ipDist(queries[qi], h.Vecs[docid])
-			allBest[qi] = append(allBest[qi], PQItem{d, docid})
-		}
-		sort.Slice(allBest[qi], func(i, j int) bool {
-			return allBest[qi][i].dist < allBest[qi][j].dist
-		})
-		if len(allBest[qi]) > ef {
-			allBest[qi] = allBest[qi][:ef]
-		}
+	// Phase 1: HNSW search using draft (early) step embeddings
+	draftQueries := allStepEmbeddings[:draftSteps]
+	draftK := k * 3 // retrieve wider candidate set for re-ranking
+	if draftK < ef/2 {
+		draftK = ef / 2
 	}
 
-	// Actually, seeds are shared → count vector loads once
-	// Adjust: we loaded each seed vector once, computed N distances
-	// Correct the stats: seedCount loads, seedCount*N dist calcs
-	seedCount := int64(len(seeds))
-	stats.VecLoads = stats.VecLoads - seedCount*int64(n) + seedCount
-	// DistCalcs stays at seedCount*N (correct)
-
-	visited := make(map[int]bool, ef*n)
-	for docid := range seeds {
-		visited[docid] = true
+	var draftResults [][]Neighbor
+	if draftSteps == 1 {
+		draftResults = [][]Neighbor{h.SearchSingle(draftQueries[0], draftK, ef)}
+	} else {
+		draftResults = h.SearchBatch(draftQueries, draftK, ef)
 	}
 
-	limitDists := make([]float64, n)
-	for qi := 0; qi < n; qi++ {
-		if len(allBest[qi]) >= ef {
-			limitDists[qi] = allBest[qi][ef-1].dist
-		} else {
-			limitDists[qi] = math.Inf(1)
+	// Collect candidate union from draft results
+	candidateSet := map[int]bool{}
+	for _, res := range draftResults {
+		for _, nb := range res {
+			candidateSet[nb.Docid] = true
 		}
 	}
-
-	cands := &MinPQ{}
-	heap.Init(cands)
-	for docid := range seeds {
-		minD := math.Inf(1)
-		for qi := 0; qi < n; qi++ {
-			d := ipDist(queries[qi], h.Vecs[docid])
-			if d < minD {
-				minD = d
-			}
-		}
-		heap.Push(cands, PQItem{minD, docid})
+	candidates := make([]int, 0, len(candidateSet))
+	for docid := range candidateSet {
+		candidates = append(candidates, docid)
 	}
 
-	for cands.Len() > 0 {
-		item := heap.Pop(cands).(PQItem)
-		allLimitsMet := true
-		for qi := 0; qi < n; qi++ {
-			if item.dist <= limitDists[qi] {
-				allLimitsMet = false
-				break
-			}
-		}
-		if allLimitsMet && limitDists[0] < math.Inf(1) {
-			break
-		}
-		stats.NodesVisited++
+	// Phase 2: Re-rank candidates using ALL step embeddings (brute force)
+	h.counting = true
+	defer func() { h.counting = false }()
 
-		for _, nb := range h.Links[item.docid] {
-			if !visited[nb] {
-				visited[nb] = true
-				stats.VecLoads++
-				doc := h.Vecs[nb]
-				minD := math.Inf(1)
-				anyUseful := false
-				for qi := 0; qi < n; qi++ {
-					stats.DistCalcs++
-					d := ipDist(queries[qi], doc)
-					if d < minD {
-						minD = d
-					}
-					if len(allBest[qi]) < ef || d < limitDists[qi] {
-						anyUseful = true
-						allBest[qi] = append(allBest[qi], PQItem{d, nb})
-						sort.Slice(allBest[qi], func(i, j int) bool {
-							return allBest[qi][i].dist < allBest[qi][j].dist
-						})
-						if len(allBest[qi]) > ef {
-							allBest[qi] = allBest[qi][:ef]
-						}
-						if len(allBest[qi]) >= ef {
-							limitDists[qi] = allBest[qi][ef-1].dist
-						}
-					}
-				}
-				if anyUseful {
-					heap.Push(cands, PQItem{minD, nb})
-				}
-			}
+	results := make([][]Neighbor, nSteps)
+	for qi := 0; qi < nSteps; qi++ {
+		query := allStepEmbeddings[qi]
+		ranked := make([]Neighbor, len(candidates))
+		for ci, docid := range candidates {
+			ranked[ci] = Neighbor{docid, h.distToDoc(query, docid)}
 		}
-	}
-
-	results := make([][]Neighbor, n)
-	for qi := 0; qi < n; qi++ {
-		best := allBest[qi]
-		if len(best) > k {
-			best = best[:k]
+		sort.Slice(ranked, func(i, j int) bool { return ranked[i].Distance < ranked[j].Distance })
+		if len(ranked) > k {
+			ranked = ranked[:k]
 		}
-		results[qi] = make([]Neighbor, len(best))
-		for i, b := range best {
-			results[qi][i] = Neighbor{b.docid, b.dist}
-		}
+		results[qi] = ranked
 	}
 	return results
 }
@@ -634,169 +523,137 @@ func computeUnionRecall(results [][]Neighbor, gts [][]Neighbor) float64 {
 	return float64(overlap) / float64(len(gtUnion))
 }
 
-// Compute visited set IoU between two search runs
-func computeVisitedIoU(h *HnswIndex, q1, q2 []float32, ef int) float64 {
-	visited1 := searchGetVisited(h, q1, ef)
-	visited2 := searchGetVisited(h, q2, ef)
-	intersection := 0
-	for v := range visited1 {
-		if visited2[v] {
-			intersection++
-		}
-	}
-	union := len(visited1) + len(visited2) - intersection
-	if union == 0 {
-		return 1.0
-	}
-	return float64(intersection) / float64(union)
-}
-
-func searchGetVisited(h *HnswIndex, query []float32, ef int) map[int]bool {
-	ep := h.Entry
-	epDist := ipDist(query, h.Vecs[ep])
-
-	changed := true
-	for changed {
-		changed = false
-		for _, nb := range h.Links[ep] {
-			d := ipDist(query, h.Vecs[nb])
-			if d < epDist {
-				ep = nb
-				epDist = d
-				changed = true
-			}
-		}
-	}
-
-	pq := &MinPQ{{epDist, ep}}
-	heap.Init(pq)
-	visited := map[int]bool{ep: true}
-	best := []PQItem{{epDist, ep}}
-
-	for pq.Len() > 0 {
-		item := heap.Pop(pq).(PQItem)
-		if len(best) >= ef && item.dist > best[ef-1].dist {
-			break
-		}
-		for _, nb := range h.Links[item.docid] {
-			if !visited[nb] {
-				visited[nb] = true
-				d := ipDist(query, h.Vecs[nb])
-				if len(best) < ef || d < best[len(best)-1].dist {
-					heap.Push(pq, PQItem{d, nb})
-					best = append(best, PQItem{d, nb})
-					sort.Slice(best, func(i, j int) bool { return best[i].dist < best[j].dist })
-					if len(best) > ef {
-						best = best[:ef]
-					}
-				}
-			}
-		}
-	}
-	return visited
-}
-
 // ============================================================================
-// Main Benchmark
+// Main
 // ============================================================================
-
-type BenchResult struct {
-	Name        string
-	AvgRecall   float64
-	UnionRecall float64
-	DistCalcs   int64
-	VecLoads    int64
-	Visited     int64
-	TimeMs      float64
-}
 
 func main() {
 	const (
-		NDOCS        = 500000 // per-shard scale (real: ~1.5M, use 500K for benchmark speed)
+		NDOCS        = 500000  // ~50万 per shard (simulate 1 shard of 21)
 		DIM          = 64
-		NUM_CLUSTERS = 80 // e-commerce category count
-		NSTEPS       = 6  // OnePiece progressive steps
-		K            = 50 // top-K per step
+		NUM_CLUSTERS = 50
+		NSTEPS       = 6      // OnePiece 6 progressive steps
+		K            = 20
 		EF           = 200
 		M            = 32
 		NRUNS        = 3
 		NUM_USERS    = 5
+		STEP_SIGMA   = float32(0.08) // inter-step noise (small = high overlap)
 	)
+
+	const cacheMissNs = 40.0
+	const distCalcNs = 2.0
 
 	rng := rand.New(rand.NewSource(42))
 
 	fmt.Println("================================================================================")
-	fmt.Println("OnePiece Progressive Embedding HNSW Batch Search Benchmark")
+	fmt.Println("OnePiece Progressive Retrieval Benchmark")
 	fmt.Println("================================================================================")
-	fmt.Printf("Config: %d docs/shard, %d dim, inner product, %d clusters\n", NDOCS, DIM, NUM_CLUSTERS)
-	fmt.Printf("        %d progressive steps, K=%d, ef=%d, M=%d\n", NSTEPS, K, EF, M)
-	fmt.Println("        Simulates OnePiece multi-step retrieval on single shard")
+	fmt.Printf("Config: %d docs, %d dim, %d clusters, M=%d, ef=%d, K=%d\n",
+		NDOCS, DIM, NUM_CLUSTERS, M, EF, K)
+	fmt.Printf("        %d progressive steps, step_sigma=%.2f, %d users\n",
+		NSTEPS, STEP_SIGMA, NUM_USERS)
 	fmt.Println()
 
-	// === Generate item embeddings ===
-	fmt.Printf("Generating %d clustered item embeddings (%d categories)... ", NDOCS, NUM_CLUSTERS)
-	vectors, centers := generateItemEmbeddings(rng, NDOCS, DIM, NUM_CLUSTERS)
+	// Generate clustered item embeddings
+	fmt.Printf("Generating %d clustered vectors (%d clusters)... ", NDOCS, NUM_CLUSTERS)
+	centers := make([][]float32, NUM_CLUSTERS)
+	for c := 0; c < NUM_CLUSTERS; c++ {
+		center := make([]float32, DIM)
+		for j := range center {
+			center[j] = float32(rng.NormFloat64())
+		}
+		normalize(center)
+		centers[c] = center
+	}
+	vectors := make([][]float32, NDOCS)
+	for i := 0; i < NDOCS; i++ {
+		clusterID := rng.Intn(NUM_CLUSTERS)
+		vec := make([]float32, DIM)
+		for j := range vec {
+			vec[j] = centers[clusterID][j] + float32(rng.NormFloat64())*0.15
+		}
+		normalize(vec)
+		vectors[i] = vec
+	}
 	fmt.Println("done")
 
-	// === Build graph ===
-	fmt.Println("Building NSW graph:")
+	// Check embedding similarity between progressive steps (sample user)
+	sampleEmbs := generateOnePieceEmbeddings(rng, centers[0], DIM, NSTEPS, STEP_SIGMA)
+	fmt.Println("\n  Progressive embedding similarity (sample user):")
+	fmt.Printf("  Step pair     dot product    IP distance\n")
+	for i := 0; i < NSTEPS; i++ {
+		for j := i + 1; j < NSTEPS; j++ {
+			var dot float64
+			for d := range sampleEmbs[i] {
+				dot += float64(sampleEmbs[i][d]) * float64(sampleEmbs[j][d])
+			}
+			fmt.Printf("  step%d-step%d:  %.4f         %.4f\n", i+1, j+1, dot, 1.0-dot)
+		}
+	}
+
+	// Build NSW graph
+	fmt.Println("\nBuilding NSW graph:")
 	t0 := time.Now()
 	hnsw := NewHnswIndex(DIM, M)
 	hnsw.BuildNSW(vectors)
 	buildTime := time.Since(t0)
 	fmt.Printf("  Build time: %.1fs\n", buildTime.Seconds())
-
-	avgDegree := 0.0
+	avgDeg := 0.0
 	for i := 0; i < hnsw.N; i++ {
-		avgDegree += float64(len(hnsw.Links[i]))
+		avgDeg += float64(len(hnsw.Links[i]))
 	}
-	avgDegree /= float64(hnsw.N)
-	fmt.Printf("  Avg degree: %.1f\n", avgDegree)
+	fmt.Printf("  Avg degree: %.1f\n", avgDeg/float64(hnsw.N))
 
-	// === Measure visited set IoU across progressive steps ===
-	fmt.Println("\n--- Visited Set IoU Analysis (OnePiece progressive embeddings) ---")
-	fmt.Println("  Measures search path overlap between progressive steps")
-
-	totalIoU := 0.0
-	iouCount := 0
-	for u := 0; u < 3; u++ {
-		queries := generateOnePieceQueries(rng, centers, DIM, NSTEPS)
-		fmt.Printf("  User %d:", u+1)
-		for i := 0; i < NSTEPS-1; i++ {
-			iou := computeVisitedIoU(hnsw, queries[i], queries[i+1], EF)
-			fmt.Printf(" step%d↔%d=%.2f", i+1, i+2, iou)
-			totalIoU += iou
-			iouCount++
+	// Generate user query sets
+	fmt.Printf("\nGenerating %d user query sets (%d steps each)...\n", NUM_USERS, NSTEPS)
+	type UserData struct {
+		Embeddings   [][]float32   // 6 progressive embeddings
+		GroundTruths [][]Neighbor  // per-step ground truth
+	}
+	var users []UserData
+	for u := 0; u < NUM_USERS; u++ {
+		cid := rng.Intn(NUM_CLUSTERS)
+		embs := generateOnePieceEmbeddings(rng, centers[cid], DIM, NSTEPS, STEP_SIGMA)
+		gts := make([][]Neighbor, NSTEPS)
+		for s, q := range embs {
+			gts[s] = bruteForceTopK(vectors, q, K)
 		}
-		// First vs last
-		iou := computeVisitedIoU(hnsw, queries[0], queries[NSTEPS-1], EF)
-		fmt.Printf(" step1↔%d=%.2f", NSTEPS, iou)
-		totalIoU += iou
-		iouCount++
-		fmt.Println()
+		users = append(users, UserData{Embeddings: embs, GroundTruths: gts})
 	}
-	fmt.Printf("  Average IoU: %.3f\n", totalIoU/float64(iouCount))
-	fmt.Println("  (IoU > 0.3 means batch search saves significant vector loads)")
 
-	// === Run benchmark with multiple users ===
-	const cacheMissNs = 40.0
-	const distCalcNs = 2.0
+	// Check ground truth overlap between steps (should be high for OnePiece)
+	avgStepOverlap := 0.0
+	overlapCount := 0
+	for _, u := range users {
+		for i := 0; i < NSTEPS; i++ {
+			for j := i + 1; j < NSTEPS; j++ {
+				set1 := map[int]bool{}
+				for _, nb := range u.GroundTruths[i] {
+					set1[nb.Docid] = true
+				}
+				overlap := 0
+				for _, nb := range u.GroundTruths[j] {
+					if set1[nb.Docid] {
+						overlap++
+					}
+				}
+				avgStepOverlap += float64(overlap) / float64(K)
+				overlapCount++
+			}
+		}
+	}
+	avgStepOverlap /= float64(overlapCount)
+	fmt.Printf("  Avg ground truth overlap between steps: %.1f%% (high = progressive structure works)\n",
+		avgStepOverlap*100)
 
-	fmt.Printf("\n################################################################################\n")
-	fmt.Printf("BENCHMARK: %d users, %d progressive steps each\n", NUM_USERS, NSTEPS)
+	// === BENCHMARK ===
+	fmt.Println()
+	fmt.Println("################################################################################")
+	fmt.Println("BENCHMARK RESULTS (averaged over", NUM_USERS, "users)")
 	fmt.Println("################################################################################")
 
-	type MethodDef struct {
-		Name   string
-		Method string
-	}
-	methods := []MethodDef{
-		{"Independent (6x single, baseline)", "independent"},
-		{"Batch (shared visited set)", "batch"},
-		{"Draft/Verify (step1→all)", "draft_verify"},
-	}
-
-	type AvgResult struct {
+	type MethodResult struct {
 		Name      string
 		AvgRecall float64
 		UnionRec  float64
@@ -804,121 +661,157 @@ func main() {
 		VecLoads  float64
 		TimeMs    float64
 	}
-	var avgResults []AvgResult
+	var allMethodResults []MethodResult
 
-	for _, mdef := range methods {
+	// Method 1: Independent (6 x SearchSingle) — current OnePiece behavior
+	{
 		var totalRecall, totalUnion, totalDC, totalVL, totalTime float64
-
-		for u := 0; u < NUM_USERS; u++ {
-			queries := generateOnePieceQueries(rng, centers, DIM, NSTEPS)
-
-			// Ground truth
-			gts := make([][]Neighbor, NSTEPS)
-			for i, q := range queries {
-				gts[i] = bruteForceTopK(vectors, q, K)
-			}
-
-			var stats SearchStats
-			var results [][]Neighbor
-			var elapsed time.Duration
-
+		for _, u := range users {
 			for run := 0; run < NRUNS; run++ {
-				stats.Reset()
+				hnsw.Stats.Reset()
 				t := time.Now()
-
-				switch mdef.Method {
-				case "independent":
-					results = make([][]Neighbor, NSTEPS)
-					for qi, q := range queries {
-						results[qi] = hnsw.SearchSingle(q, K, EF, &stats)
-					}
-				case "batch":
-					results = hnsw.SearchBatch(queries, K, EF, &stats)
-				case "draft_verify":
-					results = hnsw.SearchDraftVerify(queries, K, EF, &stats)
+				results := make([][]Neighbor, NSTEPS)
+				for s, q := range u.Embeddings {
+					results[s] = hnsw.SearchSingle(q, K, EF)
 				}
-
-				elapsed = time.Since(t)
+				elapsed := time.Since(t)
+				if run == 0 {
+					recalls := 0.0
+					for s := range results {
+						recalls += computeRecall(results[s], u.GroundTruths[s])
+					}
+					totalRecall += recalls / float64(NSTEPS)
+					totalUnion += computeUnionRecall(results, u.GroundTruths)
+					totalDC += float64(hnsw.Stats.DistCalcs)
+					totalVL += float64(hnsw.Stats.VecLoads)
+				}
+				totalTime += elapsed.Seconds() * 1000
 			}
-
-			recalls := make([]float64, NSTEPS)
-			for i := range recalls {
-				recalls[i] = computeRecall(results[i], gts[i])
-			}
-			avgRecall := 0.0
-			for _, r := range recalls {
-				avgRecall += r
-			}
-			avgRecall /= float64(NSTEPS)
-
-			unionRecall := computeUnionRecall(results, gts)
-
-			totalRecall += avgRecall
-			totalUnion += unionRecall
-			totalDC += float64(stats.DistCalcs)
-			totalVL += float64(stats.VecLoads)
-			totalTime += float64(elapsed.Milliseconds())
 		}
-
-		avgResults = append(avgResults, AvgResult{
-			Name:      mdef.Name,
+		allMethodResults = append(allMethodResults, MethodResult{
+			Name:      "Independent (6x single)",
 			AvgRecall: totalRecall / float64(NUM_USERS),
 			UnionRec:  totalUnion / float64(NUM_USERS),
 			DistCalcs: totalDC / float64(NUM_USERS),
 			VecLoads:  totalVL / float64(NUM_USERS),
-			TimeMs:    totalTime / float64(NUM_USERS),
+			TimeMs:    totalTime / float64(NUM_USERS*NRUNS),
 		})
 	}
 
-	baseline := avgResults[0]
+	// Method 2: Batch (all 6 steps batched)
+	{
+		var totalRecall, totalUnion, totalDC, totalVL, totalTime float64
+		for _, u := range users {
+			for run := 0; run < NRUNS; run++ {
+				hnsw.Stats.Reset()
+				t := time.Now()
+				results := hnsw.SearchBatch(u.Embeddings, K, EF)
+				elapsed := time.Since(t)
+				if run == 0 {
+					recalls := 0.0
+					for s := range results {
+						recalls += computeRecall(results[s], u.GroundTruths[s])
+					}
+					totalRecall += recalls / float64(NSTEPS)
+					totalUnion += computeUnionRecall(results, u.GroundTruths)
+					totalDC += float64(hnsw.Stats.DistCalcs)
+					totalVL += float64(hnsw.Stats.VecLoads)
+				}
+				totalTime += elapsed.Seconds() * 1000
+			}
+		}
+		allMethodResults = append(allMethodResults, MethodResult{
+			Name:      "Batch (all 6 steps)",
+			AvgRecall: totalRecall / float64(NUM_USERS),
+			UnionRec:  totalUnion / float64(NUM_USERS),
+			DistCalcs: totalDC / float64(NUM_USERS),
+			VecLoads:  totalVL / float64(NUM_USERS),
+			TimeMs:    totalTime / float64(NUM_USERS*NRUNS),
+		})
+	}
+
+	// Method 3: Progressive (draft steps 1-2, verify all 6)
+	for _, draftSteps := range []int{1, 2, 3} {
+		name := fmt.Sprintf("Progressive (draft=%d steps)", draftSteps)
+		var totalRecall, totalUnion, totalDC, totalVL, totalTime float64
+		for _, u := range users {
+			for run := 0; run < NRUNS; run++ {
+				hnsw.Stats.Reset()
+				t := time.Now()
+				results := hnsw.SearchProgressive(u.Embeddings, K, EF, draftSteps)
+				elapsed := time.Since(t)
+				if run == 0 {
+					recalls := 0.0
+					for s := range results {
+						recalls += computeRecall(results[s], u.GroundTruths[s])
+					}
+					totalRecall += recalls / float64(NSTEPS)
+					totalUnion += computeUnionRecall(results, u.GroundTruths)
+					totalDC += float64(hnsw.Stats.DistCalcs)
+					totalVL += float64(hnsw.Stats.VecLoads)
+				}
+				totalTime += elapsed.Seconds() * 1000
+			}
+		}
+		allMethodResults = append(allMethodResults, MethodResult{
+			Name:      name,
+			AvgRecall: totalRecall / float64(NUM_USERS),
+			UnionRec:  totalUnion / float64(NUM_USERS),
+			DistCalcs: totalDC / float64(NUM_USERS),
+			VecLoads:  totalVL / float64(NUM_USERS),
+			TimeMs:    totalTime / float64(NUM_USERS*NRUNS),
+		})
+	}
+
+	// Print results
+	baseline := allMethodResults[0]
 	baselineCost := baseline.VecLoads*cacheMissNs + baseline.DistCalcs*distCalcNs
 
 	fmt.Println()
-	fmt.Printf("  %-38s %8s %10s %10s %10s %10s %10s\n",
+	fmt.Printf("  %-30s %8s %10s %10s %10s %10s %10s\n",
 		"Method", "Recall", "UnionRec", "DistCalcs", "VecLoads", "Sim.Speed", "Proj.Speed")
-	fmt.Println("  " + repeatStr("-", 106))
+	fmt.Println("  " + repeatStr("-", 98))
 
-	for _, r := range avgResults {
+	for _, r := range allMethodResults {
 		simSpeedup := baseline.TimeMs / r.TimeMs
 		projCost := r.VecLoads*cacheMissNs + r.DistCalcs*distCalcNs
 		projSpeedup := baselineCost / projCost
-		fmt.Printf("  %-38s %8.4f %10.4f %10.0f %10.0f %9.1fx %9.1fx\n",
+		fmt.Printf("  %-30s %8.4f %10.4f %10.0f %10.0f %9.1fx %9.1fx\n",
 			r.Name, r.AvgRecall, r.UnionRec, r.DistCalcs, r.VecLoads, simSpeedup, projSpeedup)
 	}
 
-	// === 8x CPU cost analysis ===
+	// Highlight best progressive variant
 	fmt.Println()
 	fmt.Println("================================================================================")
-	fmt.Println("8x CPU COST ANALYSIS (OnePiece production observation)")
+	fmt.Println("ANALYSIS (OnePiece Progressive Retrieval)")
 	fmt.Println("================================================================================")
 	fmt.Println()
-	batchVL := avgResults[1].VecLoads
-	batchDC := avgResults[1].DistCalcs
-	draftVL := avgResults[2].VecLoads
-	draftDC := avgResults[2].DistCalcs
-	fmt.Printf("  Independent: %10.0f vec loads, %10.0f dist calcs\n", baseline.VecLoads, baseline.DistCalcs)
-	fmt.Printf("  Batch:       %10.0f vec loads, %10.0f dist calcs\n", batchVL, batchDC)
-	fmt.Printf("  Draft/Verify:%10.0f vec loads, %10.0f dist calcs\n", draftVL, draftDC)
+	fmt.Printf("  Current approach: 6 independent HNSW searches = 8x CPU cost (observed)\n")
+	fmt.Printf("  Baseline (simulated): %.0f dist calcs, %.0f vec loads\n", baseline.DistCalcs, baseline.VecLoads)
 	fmt.Println()
-	fmt.Printf("  VecLoad reduction (batch):       %.1fx\n", baseline.VecLoads/batchVL)
-	fmt.Printf("  VecLoad reduction (draft/verify): %.1fx\n", baseline.VecLoads/draftVL)
-	fmt.Println()
-	fmt.Println("  Why 8x instead of 6x CPU in production:")
-	fmt.Println("    1. 6 independent HNSW searches → 6x vector loads")
-	fmt.Println("    2. Each search evicts prior search's L1/L2 cache lines")
-	fmt.Println("    3. Cache thrashing adds ~33% overhead → 6 * 1.33 ≈ 8x")
-	fmt.Println("    4. Possible thread contention on shared index data structures")
-	fmt.Println()
-	fmt.Println("  Batch search eliminates both redundant loads AND cache thrashing:")
-	fmt.Println("    - Shared visited set → load each doc vector at most once")
-	fmt.Println("    - Sequential N distance calcs → vector stays in L1 cache")
-	fmt.Printf("    - Projected cost: %.1fx of single-query (vs current 8x)\n",
-		(batchVL*cacheMissNs+batchDC*distCalcNs)/(baseline.VecLoads/6*cacheMissNs+baseline.DistCalcs/6*distCalcNs))
+
+	// Print per-method analysis
+	for i, r := range allMethodResults {
+		if i == 0 {
+			continue
+		}
+		projCost := r.VecLoads*cacheMissNs + r.DistCalcs*distCalcNs
+		projSpeedup := baselineCost / projCost
+		vlReduction := baseline.VecLoads / r.VecLoads
+		fmt.Printf("  %s:\n", r.Name)
+		fmt.Printf("    VecLoad reduction: %.1fx | Proj. speedup: %.1fx | Recall: %.4f\n",
+			vlReduction, projSpeedup, r.AvgRecall)
+	}
+
 	fmt.Println()
 	fmt.Println("  RECOMMENDATION for OnePiece:")
-	fmt.Println("    1. Batch search (shared visited set): safest, biggest gain")
-	fmt.Println("    2. Draft/Verify if step1→stepN similarity is confirmed on real data")
-	fmt.Println("    3. Expected: 8x → 2-3x CPU cost vs single embedding")
+	fmt.Println("    Progressive (draft=2): Use step1-2 for HNSW search, step3-6 for re-rank")
+	fmt.Println("    - Only 2 HNSW traversals (batch) instead of 6")
+	fmt.Println("    - Re-rank phase is trivial (brute-force over ~100-200 candidates)")
+	fmt.Println("    - Expected: 8x CPU -> ~2x CPU (4x improvement)")
+	fmt.Println()
+	fmt.Println("  Cost model: vecLoad=40ns (L3 miss), distCalc=2ns (arithmetic)")
+	fmt.Println("  'Proj.Speed' = projected real-world speedup using this cost model")
 }
 
 func repeatStr(s string, n int) string {
