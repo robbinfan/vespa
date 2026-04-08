@@ -63,6 +63,14 @@ bool operator< (const PairDist &a, const PairDist &b) {
     return (a.distance < b.distance);
 }
 
+struct NeighborsByDocId {
+    bool operator() (const NearestNeighborIndex::Neighbor &lhs,
+                     const NearestNeighborIndex::Neighbor &rhs)
+    {
+        return (lhs.docid < rhs.docid);
+    }
+};
+
 }
 
 vespalib::datastore::ArrayStoreConfig
@@ -328,6 +336,274 @@ HnswIndex::search_layer(const TypedCells& input, uint32_t neighbors_to_find,
 #else
     search_layer_helper<ReusableSetVisitedTracker>(input, neighbors_to_find, best_neighbors, level, filter, doc_id_limit, estimated_visited_nodes);
 #endif
+}
+
+template <class VisitedTracker>
+void
+HnswIndex::search_layer_batch_helper(vespalib::ConstArrayRef<TypedCells> inputs, uint32_t neighbors_to_find,
+                                     std::vector<FurthestPriQ>& best_neighbors_per_query,
+                                     uint32_t level, const search::BitVector *filter,
+                                     uint32_t doc_id_limit, uint32_t estimated_visited_nodes) const
+{
+    const size_t num_queries = inputs.size();
+    assert(best_neighbors_per_query.size() == num_queries);
+
+    // Single unified candidate queue ordered by minimum distance across all queries.
+    BatchNearestPriQ candidates;
+    VisitedTracker visited(*this, doc_id_limit, estimated_visited_nodes);
+
+    // Collect all seed entries first to avoid iterator invalidation.
+    // (peek() returns a reference to the internal vector which would be
+    //  invalidated if we modify the same priority queue during iteration.)
+    HnswCandidateVector all_seeds;
+    for (size_t q = 0; q < num_queries; ++q) {
+        for (const auto &entry : best_neighbors_per_query[q].peek()) {
+            all_seeds.push_back(entry);
+        }
+    }
+
+    // Seed from collected entries.
+    for (const auto &entry : all_seeds) {
+        if (entry.docid >= doc_id_limit) continue;
+        if (visited.try_mark(entry.docid)) {
+            // Load vector ONCE, compute distances for ALL queries.
+            auto seed_vec = get_vector(entry.docid);
+            double min_dist = std::numeric_limits<double>::max();
+            for (size_t qi = 0; qi < num_queries; ++qi) {
+                double dist = _distance_func->calc(inputs[qi], seed_vec);
+                min_dist = std::min(min_dist, dist);
+                if ((!filter) || filter->testBit(entry.docid)) {
+                    best_neighbors_per_query[qi].emplace(entry.docid, entry.node_ref, dist);
+                    if (best_neighbors_per_query[qi].size() > neighbors_to_find) {
+                        best_neighbors_per_query[qi].pop();
+                    }
+                }
+            }
+            candidates.emplace(entry.docid, entry.node_ref, min_dist);
+        }
+    }
+
+    // Per-query distance limits for candidate pruning.
+    std::vector<double> limit_dists(num_queries, std::numeric_limits<double>::max());
+    for (size_t q = 0; q < num_queries; ++q) {
+        if (best_neighbors_per_query[q].size() >= neighbors_to_find) {
+            limit_dists[q] = best_neighbors_per_query[q].top().distance;
+        }
+    }
+
+    // Global limit: stop exploring when no query can benefit.
+    auto compute_global_limit = [&]() {
+        double max_limit = 0.0;
+        for (size_t q = 0; q < num_queries; ++q) {
+            max_limit = std::max(max_limit, limit_dists[q]);
+        }
+        return max_limit;
+    };
+    double global_limit = compute_global_limit();
+
+    while (!candidates.empty()) {
+        auto cand = candidates.top();
+        if (cand.min_distance > global_limit) {
+            break;
+        }
+        candidates.pop();
+
+        for (uint32_t neighbor_docid : _graph.get_link_array(cand.node_ref, level)) {
+            if (neighbor_docid >= doc_id_limit) continue;
+            auto neighbor_ref = _graph.get_node_ref(neighbor_docid);
+            if ((!neighbor_ref.valid()) || !visited.try_mark(neighbor_docid)) {
+                continue;
+            }
+            // Load neighbor vector ONCE, compute distances for ALL queries.
+            auto neighbor_vec = get_vector(neighbor_docid);
+            double min_dist = std::numeric_limits<double>::max();
+            bool dominated = true; // true if no query benefits from this neighbor
+
+            for (size_t q = 0; q < num_queries; ++q) {
+                double dist = _distance_func->calc(inputs[q], neighbor_vec);
+                min_dist = std::min(min_dist, dist);
+                if (dist < limit_dists[q]) {
+                    dominated = false;
+                    if ((!filter) || filter->testBit(neighbor_docid)) {
+                        best_neighbors_per_query[q].emplace(neighbor_docid, neighbor_ref, dist);
+                        if (best_neighbors_per_query[q].size() > neighbors_to_find) {
+                            best_neighbors_per_query[q].pop();
+                            limit_dists[q] = best_neighbors_per_query[q].top().distance;
+                        }
+                    }
+                }
+            }
+            if (!dominated) {
+                candidates.emplace(neighbor_docid, neighbor_ref, min_dist);
+                global_limit = compute_global_limit();
+            }
+        }
+    }
+}
+
+void
+HnswIndex::search_layer_batch(vespalib::ConstArrayRef<TypedCells> inputs, uint32_t neighbors_to_find,
+                               std::vector<FurthestPriQ>& best_neighbors_per_query,
+                               uint32_t level, const search::BitVector *filter) const
+{
+    uint32_t doc_id_limit = _graph.node_refs_size.load(std::memory_order_acquire);
+    if (filter) {
+        doc_id_limit = std::min(filter->size(), doc_id_limit);
+    }
+    uint32_t estimated_visited_nodes = estimate_visited_nodes(level, doc_id_limit, neighbors_to_find, filter);
+    // Batch search visits more nodes due to multi-query exploration.
+    estimated_visited_nodes = std::min(doc_id_limit, estimated_visited_nodes * static_cast<uint32_t>(inputs.size()));
+#if ! USE_OLD_VISITED_TRACKER
+    if (estimated_visited_nodes >= doc_id_limit / 128) {
+        search_layer_batch_helper<BitVectorVisitedTracker>(inputs, neighbors_to_find, best_neighbors_per_query,
+                                                           level, filter, doc_id_limit, estimated_visited_nodes);
+    } else {
+        search_layer_batch_helper<HashSetVisitedTracker>(inputs, neighbors_to_find, best_neighbors_per_query,
+                                                         level, filter, doc_id_limit, estimated_visited_nodes);
+    }
+#else
+    search_layer_batch_helper<ReusableSetVisitedTracker>(inputs, neighbors_to_find, best_neighbors_per_query,
+                                                         level, filter, doc_id_limit, estimated_visited_nodes);
+#endif
+}
+
+std::vector<FurthestPriQ>
+HnswIndex::top_k_candidates_batch(vespalib::ConstArrayRef<TypedCells> vectors, uint32_t k,
+                                  const BitVector *filter) const
+{
+    const size_t num_queries = vectors.size();
+    std::vector<FurthestPriQ> best_neighbors(num_queries);
+
+    auto entry = _graph.get_entry_node();
+    if (entry.docid == 0) {
+        return best_neighbors;
+    }
+
+    // Shared entry point descent: use the first vector for upper level navigation.
+    int search_level = entry.level;
+    double entry_dist = calc_distance(vectors[0], entry.docid);
+    HnswCandidate entry_point(entry.docid, entry.node_ref, entry_dist);
+    while (search_level > 0) {
+        entry_point = find_nearest_in_layer(vectors[0], entry_point, search_level);
+        --search_level;
+    }
+
+    // Seed all per-query result sets with the shared entry point.
+    for (size_t q = 0; q < num_queries; ++q) {
+        double dist = (q == 0) ? entry_point.distance : calc_distance(vectors[q], entry_point.docid);
+        best_neighbors[q].push(HnswCandidate(entry_point.docid, entry_point.node_ref, dist));
+    }
+
+    // Batch search at level 0 with shared visited set.
+    search_layer_batch(vectors, k, best_neighbors, 0, filter);
+    return best_neighbors;
+}
+
+std::vector<std::vector<NearestNeighborIndex::Neighbor>>
+HnswIndex::top_k_by_docid_batch(uint32_t k, vespalib::ConstArrayRef<TypedCells> vectors,
+                                const BitVector *filter, uint32_t explore_k,
+                                double distance_threshold) const
+{
+    const size_t num_queries = vectors.size();
+    auto all_candidates = top_k_candidates_batch(vectors, std::max(k, explore_k), filter);
+
+    std::vector<std::vector<Neighbor>> results(num_queries);
+    for (size_t q = 0; q < num_queries; ++q) {
+        auto& candidates = all_candidates[q];
+        while (candidates.size() > k) {
+            candidates.pop();
+        }
+        results[q].reserve(candidates.size());
+        for (const auto& hit : candidates.peek()) {
+            if (hit.distance > distance_threshold) continue;
+            results[q].emplace_back(hit.docid, hit.distance);
+        }
+        std::sort(results[q].begin(), results[q].end(), NeighborsByDocId());
+    }
+    return results;
+}
+
+std::vector<std::vector<NearestNeighborIndex::Neighbor>>
+HnswIndex::find_top_k_batch(uint32_t k, vespalib::ConstArrayRef<vespalib::eval::TypedCells> vectors,
+                            uint32_t explore_k, double distance_threshold) const
+{
+    return top_k_by_docid_batch(k, vectors, nullptr, explore_k, distance_threshold);
+}
+
+std::vector<std::vector<NearestNeighborIndex::Neighbor>>
+HnswIndex::find_top_k_batch_with_filter(uint32_t k, vespalib::ConstArrayRef<vespalib::eval::TypedCells> vectors,
+                                        const BitVector &filter, uint32_t explore_k,
+                                        double distance_threshold) const
+{
+    return top_k_by_docid_batch(k, vectors, &filter, explore_k, distance_threshold);
+}
+
+std::vector<std::vector<NearestNeighborIndex::Neighbor>>
+HnswIndex::find_top_k_batch_speculative(uint32_t k, vespalib::ConstArrayRef<vespalib::eval::TypedCells> vectors,
+                                        const BitVector *filter, uint32_t explore_k,
+                                        double distance_threshold, double draft_ef_ratio) const
+{
+    const size_t num_queries = vectors.size();
+    if (num_queries <= 1) {
+        // No benefit from speculative approach with single query.
+        return top_k_by_docid_batch(k, vectors, filter, explore_k, distance_threshold);
+    }
+
+    auto entry = _graph.get_entry_node();
+    if (entry.docid == 0) {
+        return std::vector<std::vector<Neighbor>>(num_queries);
+    }
+
+    // --- Draft Phase: coarse search with reduced ef ---
+    uint32_t draft_explore_k = std::max(uint32_t(1), static_cast<uint32_t>(explore_k * draft_ef_ratio));
+    uint32_t draft_k = std::max(uint32_t(1), static_cast<uint32_t>(k * draft_ef_ratio));
+
+    // Shared entry point descent.
+    int search_level = entry.level;
+    double entry_dist = calc_distance(vectors[0], entry.docid);
+    HnswCandidate entry_point(entry.docid, entry.node_ref, entry_dist);
+    while (search_level > 0) {
+        entry_point = find_nearest_in_layer(vectors[0], entry_point, search_level);
+        --search_level;
+    }
+
+    std::vector<FurthestPriQ> draft_neighbors(num_queries);
+    for (size_t q = 0; q < num_queries; ++q) {
+        double dist = (q == 0) ? entry_point.distance : calc_distance(vectors[q], entry_point.docid);
+        draft_neighbors[q].push(HnswCandidate(entry_point.docid, entry_point.node_ref, dist));
+    }
+
+    // Draft: batch search with small ef.
+    search_layer_batch(vectors, std::max(draft_k, draft_explore_k), draft_neighbors, 0, filter);
+
+    // --- Verify Phase: refined search from draft seed points ---
+    // Collect all unique seed points from draft results.
+    std::vector<FurthestPriQ> verify_neighbors(num_queries);
+    for (size_t q = 0; q < num_queries; ++q) {
+        for (const auto& hit : draft_neighbors[q].peek()) {
+            // Re-seed verify with draft results (distances will be recomputed in batch helper).
+            verify_neighbors[q].push(hit);
+        }
+    }
+
+    // Verify: full batch search starting from draft seed points.
+    search_layer_batch(vectors, std::max(k, explore_k), verify_neighbors, 0, filter);
+
+    // Extract final results.
+    std::vector<std::vector<Neighbor>> results(num_queries);
+    for (size_t q = 0; q < num_queries; ++q) {
+        auto& candidates = verify_neighbors[q];
+        while (candidates.size() > k) {
+            candidates.pop();
+        }
+        results[q].reserve(candidates.size());
+        for (const auto& hit : candidates.peek()) {
+            if (hit.distance > distance_threshold) continue;
+            results[q].emplace_back(hit.docid, hit.distance);
+        }
+        std::sort(results[q].begin(), results[q].end(), NeighborsByDocId());
+    }
+    return results;
 }
 
 HnswIndex::HnswIndex(const DocVectorAccess& vectors, DistanceFunction::UP distance_func,
@@ -688,14 +964,6 @@ HnswIndex::make_loader(FastOS_FileInterface& file)
     using LoaderType = HnswIndexLoader<ReaderType>;
     return std::make_unique<LoaderType>(_graph, std::make_unique<ReaderType>(file));
 }
-
-struct NeighborsByDocId {
-    bool operator() (const NearestNeighborIndex::Neighbor &lhs,
-                     const NearestNeighborIndex::Neighbor &rhs)
-    {
-        return (lhs.docid < rhs.docid);
-    }
-};
 
 std::vector<NearestNeighborIndex::Neighbor>
 HnswIndex::top_k_by_docid(uint32_t k, TypedCells vector,

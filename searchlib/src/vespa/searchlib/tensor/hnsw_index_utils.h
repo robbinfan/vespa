@@ -37,6 +37,27 @@ struct LesserDistance {
 using HnswCandidateVector = std::vector<HnswCandidate>;
 
 /**
+ * Represents a candidate node for batch multi-query search.
+ * Ordered by min_distance (the minimum distance across all query vectors)
+ * to ensure we explore nodes that are promising for ANY query.
+ */
+struct BatchHnswCandidate {
+    uint32_t docid;
+    HnswGraph::NodeRef node_ref;
+    double min_distance; // minimum distance across all queries
+    BatchHnswCandidate(uint32_t docid_in, HnswGraph::NodeRef node_ref_in, double min_distance_in) noexcept
+      : docid(docid_in), node_ref(node_ref_in), min_distance(min_distance_in) {}
+};
+
+struct GreaterBatchDistance {
+    bool operator() (const BatchHnswCandidate& lhs, const BatchHnswCandidate& rhs) const {
+        return (rhs.min_distance < lhs.min_distance);
+    }
+};
+
+using BatchNearestPriQ = std::priority_queue<BatchHnswCandidate, std::vector<BatchHnswCandidate>, GreaterBatchDistance>;
+
+/**
  * Priority queue that keeps the candidate node that is nearest a point in space on top.
  */
 using NearestPriQ = std::priority_queue<HnswCandidate, HnswCandidateVector, GreaterDistance>;
