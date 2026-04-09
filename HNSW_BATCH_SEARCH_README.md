@@ -236,6 +236,99 @@ Progressive: 2 × (HNSW + filter eval) + 4 × (brute-force, trivial filter)
 Improvement: ~5× (filter checked on fewer nodes + fewer HNSW traversals)
 ```
 
+## Failed Optimization Attempts (MIND)
+
+The following approaches were explored to push MIND batch search beyond Adaptive
+Batch v1. All failed due to fundamental limitations. Documenting them here to
+avoid repeating the same dead ends.
+
+### Attempt 1: Triangle Inequality Pruning (Selective Distance Computation)
+
+**Idea**: If query A and query B are similar (small inter-query distance), use A's
+distance to a node to derive a lower bound for B's distance, skipping the distance
+computation when the bound exceeds B's current threshold.
+
+For IP distance on normalized vectors:
+```
+ipDist(q_b, doc) >= (sqrt(ipDist(anchor, doc)) - sqrt(ipDist(anchor, q_b)))²
+```
+
+**Result**: Zero effective pruning in 64 dimensions.
+
+**Why it failed**: In high-dimensional space, normalized vectors are nearly orthogonal.
+The triangle inequality bound `(√d1 - √d2)²` produces values far below actual
+distances (e.g., bound = 0.02 when actual distance = 0.8). The bound is
+mathematically correct but practically useless — it almost never exceeds the
+pruning threshold.
+
+**Lesson**: Triangle inequality pruning works well in low dimensions (2D-8D) where
+distances have more variance. In 64+ dimensions, the "curse of dimensionality"
+makes all pairwise distances concentrate around similar values, rendering
+lower bounds too loose.
+
+### Attempt 2: Per-Query Early Termination
+
+**Idea**: Track per-query "stale count" — how many consecutive candidates fail to
+improve a query's top-k. When staleCount exceeds a threshold, mark that query as
+"done" and stop computing distances for it.
+
+**Result**: Recall destroyed for spread interests (10 different clusters).
+
+**Why it failed**: Spread interests need to traverse long graph paths to reach
+distant clusters. Early in the search, many candidates are far from a spread
+interest's target — producing high stale counts. But the search eventually reaches
+the target region through graph connectivity. Premature termination cuts off this
+path before the query finds its results.
+
+**Lesson**: In HNSW, "no improvement for N steps" does NOT mean "no improvement
+possible." The graph structure means good results can appear after long plateaus,
+especially when the target region is far from the entry point. Early termination
+is fundamentally incompatible with interests that explore different graph regions.
+
+### Attempt 3: Per-Query Exploration Queues + Shared Visited Set
+
+**Idea**: Give each query its own candidate priority queue (instead of one unified
+queue), but share the visited set to avoid redundant vector loads. When any query
+visits a node, compute distances for all queries. Each query independently decides
+which neighbors to explore based on its own best candidates.
+
+**Result**: **Catastrophic failure**. Union recall dropped to 0.02-0.46. Vector loads
+increased 5-6× above independent baseline.
+
+**Why it failed**: This is a fundamental incompatibility. The shared visited set
+blocks exploration paths for other queries:
+
+```
+Query A explores region X, marking nodes v1, v2, v3, ... as visited.
+Query B needs to traverse THROUGH v1, v2, v3 to reach its target region Y.
+But v1, v2, v3 are already marked visited → Query B cannot enter region Y.
+Query B is stuck exploring whatever nodes are reachable WITHOUT going through
+the nodes Query A already visited.
+```
+
+The unified queue in v1 avoids this because ALL queries share the same exploration
+frontier — when the frontier moves through region X, it naturally continues toward
+region Y. Per-query queues fragment the exploration, and the shared visited set
+turns this fragmentation into an impenetrable barrier.
+
+**Lesson**: Shared visited set **requires** unified exploration (single candidate
+queue driving all queries together). Any approach that combines shared visited set
+with independent per-query exploration will fundamentally break recall. These two
+design choices are mutually exclusive.
+
+### Conclusion
+
+Adaptive Batch v1 (unified queue + shared visited set + adaptive clustering) is
+the optimal algorithmic approach for MIND batch search. The 3.6× / 1.5× / 1.0×
+results for concentrated / mixed / spread interests represent the algorithmic
+ceiling for this approach.
+
+Further MIND performance gains require **system-level** optimizations:
+- Thread-level parallelism (parallel interest groups)
+- SIMD batch distance computation (load vector once, compute N distances with AVX)
+- Memory prefetching during graph traversal
+- Hardware-specific tuning (cache line size, NUMA-aware allocation)
+
 ## Files Changed
 
 | File | Change |
