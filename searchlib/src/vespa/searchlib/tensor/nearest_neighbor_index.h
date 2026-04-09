@@ -4,6 +4,8 @@
 
 #include "distance_function.h"
 #include "prepare_result.h"
+#include <vespa/eval/eval/typed_cells.h>
+#include <vespa/vespalib/util/arrayref.h>
 #include <vespa/vespalib/util/generationhandler.h>
 #include <vespa/vespalib/util/memoryusage.h>
 #include <cstdint>
@@ -106,6 +108,47 @@ public:
                                                          double distance_threshold) const = 0;
 
     virtual const DistanceFunction *distance_function() const = 0;
+
+    /**
+     * Batch search: find top-k nearest neighbors for multiple query vectors simultaneously.
+     * Enables shared graph traversal and batch distance computation for multi-interest retrieval.
+     * Default implementation falls back to per-vector find_top_k.
+     */
+    virtual std::vector<std::vector<Neighbor>> find_top_k_batch(
+            uint32_t k,
+            vespalib::ConstArrayRef<vespalib::eval::TypedCells> vectors,
+            uint32_t explore_k,
+            double distance_threshold) const;
+
+    virtual std::vector<std::vector<Neighbor>> find_top_k_batch_with_filter(
+            uint32_t k,
+            vespalib::ConstArrayRef<vespalib::eval::TypedCells> vectors,
+            const BitVector &filter,
+            uint32_t explore_k,
+            double distance_threshold) const;
+
+    /**
+     * Progressive retrieval: use first draft_steps vectors for HNSW search,
+     * then brute-force re-rank the candidate set with all vectors.
+     * Designed for OnePiece-style progressive embeddings where early steps
+     * are coarse and later steps are fine-grained refinements.
+     *
+     * @param k            number of results per query vector
+     * @param vectors      all query vectors (progressive steps)
+     * @param filter       optional bitvector filter (nullptr = no filter)
+     * @param explore_k    ef parameter for HNSW search
+     * @param distance_threshold max distance threshold
+     * @param draft_steps  number of vectors to use for HNSW search (rest = re-rank only)
+     * @param candidate_multiplier  how many candidates to retrieve per draft query (multiplier of k)
+     */
+    virtual std::vector<std::vector<Neighbor>> find_top_k_progressive(
+            uint32_t k,
+            vespalib::ConstArrayRef<vespalib::eval::TypedCells> vectors,
+            const BitVector *filter,
+            uint32_t explore_k,
+            double distance_threshold,
+            uint32_t draft_steps,
+            uint32_t candidate_multiplier = 3) const;
 };
 
 }

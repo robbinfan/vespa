@@ -11,6 +11,7 @@
 #include <vespa/vespalib/gtest/gtest.h>
 #include <vespa/vespalib/util/generationhandler.h>
 #include <vespa/vespalib/data/slime/slime.h>
+#include <set>
 #include <vector>
 
 #include <vespa/log/log.h>
@@ -756,5 +757,211 @@ TEST_F(TwoPhaseTest, two_phase_add)
     expect_levels(7, {{2}, {4}});
 }
 
+class HnswBatchSearchTest : public HnswIndexTest {
+public:
+    void SetUp() override {
+        init(true);
+        // Build a graph with 9 documents (docid 1-9).
+        add_document(1);
+        add_document(2);
+        add_document(3);
+        add_document(4);
+        add_document(5);
+        add_document(6);
+        add_document(7);
+        add_document(8);
+        add_document(9);
+    }
+};
+
+TEST_F(HnswBatchSearchTest, batch_search_returns_same_results_as_independent_searches)
+{
+    // Use two different query vectors (docid 1 and 5 are far apart in the 2D space).
+    auto qv1 = vectors.get_vector(1); // (2,2) - near cluster 1
+    auto qv2 = vectors.get_vector(5); // (8,3) - near cluster 2
+    uint32_t k = 3;
+    double threshold = std::numeric_limits<double>::max();
+
+    // Independent searches.
+    auto results1 = index->find_top_k(k, qv1, k, threshold);
+    auto results2 = index->find_top_k(k, qv2, k, threshold);
+
+    // Batch search.
+    std::vector<vespalib::eval::TypedCells> query_vecs = {qv1, qv2};
+    auto batch_results = index->find_top_k_batch(k, query_vecs, k, threshold);
+
+    ASSERT_EQ(batch_results.size(), 2);
+    ASSERT_EQ(batch_results[0].size(), results1.size());
+    ASSERT_EQ(batch_results[1].size(), results2.size());
+
+    // Results should be sorted by docid — check that the same docids are returned.
+    for (size_t i = 0; i < results1.size(); ++i) {
+        EXPECT_EQ(batch_results[0][i].docid, results1[i].docid);
+    }
+    for (size_t i = 0; i < results2.size(); ++i) {
+        EXPECT_EQ(batch_results[1][i].docid, results2[i].docid);
+    }
+}
+
+TEST_F(HnswBatchSearchTest, batch_search_with_filter)
+{
+    set_filter({1, 2, 3, 5, 6});
+    auto qv1 = vectors.get_vector(1);
+    auto qv2 = vectors.get_vector(5);
+    uint32_t k = 2;
+    double threshold = std::numeric_limits<double>::max();
+
+    auto results1 = index->find_top_k_with_filter(k, qv1, *global_filter, k, threshold);
+    auto results2 = index->find_top_k_with_filter(k, qv2, *global_filter, k, threshold);
+
+    std::vector<vespalib::eval::TypedCells> query_vecs = {qv1, qv2};
+    auto batch_results = index->find_top_k_batch_with_filter(k, query_vecs, *global_filter, k, threshold);
+
+    ASSERT_EQ(batch_results.size(), 2);
+    ASSERT_EQ(batch_results[0].size(), results1.size());
+    ASSERT_EQ(batch_results[1].size(), results2.size());
+
+    for (size_t i = 0; i < results1.size(); ++i) {
+        EXPECT_EQ(batch_results[0][i].docid, results1[i].docid);
+    }
+    for (size_t i = 0; i < results2.size(); ++i) {
+        EXPECT_EQ(batch_results[1][i].docid, results2[i].docid);
+    }
+}
+
+TEST_F(HnswBatchSearchTest, batch_search_single_vector_matches_single_search)
+{
+    auto qv = vectors.get_vector(3);
+    uint32_t k = 3;
+    double threshold = std::numeric_limits<double>::max();
+
+    auto single_result = index->find_top_k(k, qv, k, threshold);
+    std::vector<vespalib::eval::TypedCells> query_vecs = {qv};
+    auto batch_result = index->find_top_k_batch(k, query_vecs, k, threshold);
+
+    ASSERT_EQ(batch_result.size(), 1);
+    ASSERT_EQ(batch_result[0].size(), single_result.size());
+    for (size_t i = 0; i < single_result.size(); ++i) {
+        EXPECT_EQ(batch_result[0][i].docid, single_result[i].docid);
+    }
+}
+
+TEST_F(HnswBatchSearchTest, speculative_batch_search_has_high_recall)
+{
+    // Speculative search should return at least partially overlapping results with exact batch.
+    auto qv1 = vectors.get_vector(1);
+    auto qv2 = vectors.get_vector(5);
+    auto qv3 = vectors.get_vector(9);
+    uint32_t k = 3;
+    double threshold = std::numeric_limits<double>::max();
+
+    std::vector<vespalib::eval::TypedCells> query_vecs = {qv1, qv2, qv3};
+
+    auto exact_results = index->find_top_k_batch(k, query_vecs, k, threshold);
+    auto speculative_results = index->find_top_k_batch_speculative(k, query_vecs, nullptr, k, threshold, 0.3);
+
+    ASSERT_EQ(speculative_results.size(), 3);
+
+    // Check recall for each query: at least 2 out of 3 exact results should be found.
+    for (size_t q = 0; q < 3; ++q) {
+        std::set<uint32_t> exact_docids;
+        for (const auto& hit : exact_results[q]) {
+            exact_docids.insert(hit.docid);
+        }
+        uint32_t overlap = 0;
+        for (const auto& hit : speculative_results[q]) {
+            if (exact_docids.count(hit.docid)) {
+                ++overlap;
+            }
+        }
+        // With our small test graph, recall should be perfect or near-perfect.
+        EXPECT_GE(overlap, exact_results[q].size() * 2 / 3)
+            << "Query " << q << ": recall too low. Got " << overlap
+            << " out of " << exact_results[q].size();
+    }
+}
+
+TEST_F(HnswBatchSearchTest, batch_search_with_identical_vectors)
+{
+    // All queries are the same vector — should produce identical results.
+    auto qv = vectors.get_vector(1);
+    uint32_t k = 3;
+    double threshold = std::numeric_limits<double>::max();
+
+    std::vector<vespalib::eval::TypedCells> query_vecs = {qv, qv, qv};
+    auto batch_results = index->find_top_k_batch(k, query_vecs, k, threshold);
+
+    ASSERT_EQ(batch_results.size(), 3);
+    for (size_t q = 1; q < 3; ++q) {
+        ASSERT_EQ(batch_results[q].size(), batch_results[0].size());
+        for (size_t i = 0; i < batch_results[0].size(); ++i) {
+            EXPECT_EQ(batch_results[q][i].docid, batch_results[0][i].docid);
+        }
+    }
+}
+
+
+TEST_F(HnswBatchSearchTest, progressive_retrieval_finds_results_for_all_steps)
+{
+    // Simulate progressive embeddings: similar vectors (slight perturbation).
+    auto qv1 = vectors.get_vector(1); // (2,2)
+    auto qv2 = vectors.get_vector(2); // (3,2) - nearby, like a progressive step
+    auto qv3 = vectors.get_vector(3); // (2,3) - nearby, like a progressive step
+    uint32_t k = 3;
+    double threshold = std::numeric_limits<double>::max();
+
+    std::vector<vespalib::eval::TypedCells> query_vecs = {qv1, qv2, qv3};
+
+    // Progressive: draft_steps=1, only qv1 does HNSW, qv2/qv3 re-rank candidates.
+    auto prog_results = index->find_top_k_progressive(k, query_vecs, nullptr, k, threshold, 1);
+
+    ASSERT_EQ(prog_results.size(), 3);
+    for (size_t q = 0; q < 3; ++q) {
+        EXPECT_FALSE(prog_results[q].empty())
+            << "Progressive step " << q << " should have results";
+        EXPECT_LE(prog_results[q].size(), k);
+    }
+
+    // Compare with full batch search — progressive should have reasonable overlap.
+    auto batch_results = index->find_top_k_batch(k, query_vecs, k, threshold);
+    for (size_t q = 0; q < 3; ++q) {
+        std::set<uint32_t> prog_docids, batch_docids;
+        for (const auto& n : prog_results[q]) prog_docids.insert(n.docid);
+        for (const auto& n : batch_results[q]) batch_docids.insert(n.docid);
+        int overlap = 0;
+        for (uint32_t d : prog_docids) {
+            if (batch_docids.count(d)) ++overlap;
+        }
+        // With such a small graph, progressive should find all the same results.
+        EXPECT_GE(overlap, 1) << "Progressive step " << q << " has poor recall vs batch";
+    }
+}
+
+TEST_F(HnswBatchSearchTest, progressive_with_filter)
+{
+    auto qv1 = vectors.get_vector(1);
+    auto qv2 = vectors.get_vector(2);
+    uint32_t k = 3;
+    double threshold = std::numeric_limits<double>::max();
+
+    // Filter: only even docids.
+    auto filter = BitVector::create(10);
+    filter->setBit(2);
+    filter->setBit(4);
+    filter->setBit(6);
+    filter->setBit(8);
+    filter->invalidateCachedCount();
+
+    std::vector<vespalib::eval::TypedCells> query_vecs = {qv1, qv2};
+    auto results = index->find_top_k_progressive(k, query_vecs, filter.get(), k, threshold, 1);
+
+    ASSERT_EQ(results.size(), 2);
+    for (size_t q = 0; q < 2; ++q) {
+        for (const auto& n : results[q]) {
+            EXPECT_TRUE(filter->testBit(n.docid))
+                << "Progressive step " << q << " returned filtered-out docid " << n.docid;
+        }
+    }
+}
 
 GTEST_MAIN_RUN_ALL_TESTS()

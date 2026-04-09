@@ -51,3 +51,5 @@ Testing
 install_manifest.txt
 *.cbp
 !/.copr/Makefile
+benchmark_batch_hnsw
+benchmark_onepiece_hnsw

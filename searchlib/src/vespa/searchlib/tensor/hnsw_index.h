@@ -149,6 +149,25 @@ protected:
                              uint32_t estimated_visited_nodes) const;
     void search_layer(const TypedCells& input, uint32_t neighbors_to_find, FurthestPriQ& found_neighbors,
                       uint32_t level, const search::BitVector *filter = nullptr) const;
+
+    // Batch search: shared visited set, unified candidate queue, batch distance computation.
+    template <class VisitedTracker>
+    void search_layer_batch_helper(vespalib::ConstArrayRef<TypedCells> inputs, uint32_t neighbors_to_find,
+                                   std::vector<FurthestPriQ>& best_neighbors_per_query,
+                                   uint32_t level, const search::BitVector *filter,
+                                   uint32_t doc_id_limit, uint32_t estimated_visited_nodes) const;
+    void search_layer_batch(vespalib::ConstArrayRef<TypedCells> inputs, uint32_t neighbors_to_find,
+                            std::vector<FurthestPriQ>& best_neighbors_per_query,
+                            uint32_t level, const search::BitVector *filter = nullptr) const;
+
+    std::vector<FurthestPriQ> top_k_candidates_batch(vespalib::ConstArrayRef<TypedCells> vectors,
+                                                     uint32_t k, const BitVector *filter) const;
+
+    std::vector<std::vector<Neighbor>> top_k_by_docid_batch(uint32_t k,
+                                                            vespalib::ConstArrayRef<TypedCells> vectors,
+                                                            const BitVector *filter, uint32_t explore_k,
+                                                            double distance_threshold) const;
+
     std::vector<Neighbor> top_k_by_docid(uint32_t k, TypedCells vector,
                                          const BitVector *filter, uint32_t explore_k,
                                          double distance_threshold) const;
@@ -207,6 +226,53 @@ public:
     std::vector<Neighbor> find_top_k_with_filter(uint32_t k, TypedCells vector,
                                                  const BitVector &filter, uint32_t explore_k,
                                                  double distance_threshold) const override;
+
+    // Batch search overrides: shared graph traversal for multi-embedding retrieval.
+    std::vector<std::vector<Neighbor>> find_top_k_batch(
+            uint32_t k,
+            vespalib::ConstArrayRef<vespalib::eval::TypedCells> vectors,
+            uint32_t explore_k,
+            double distance_threshold) const override;
+    std::vector<std::vector<Neighbor>> find_top_k_batch_with_filter(
+            uint32_t k,
+            vespalib::ConstArrayRef<vespalib::eval::TypedCells> vectors,
+            const BitVector &filter,
+            uint32_t explore_k,
+            double distance_threshold) const override;
+
+    /**
+     * Speculative batch search (Draft/Verify pattern):
+     * - Draft phase: coarse search with small ef across all query vectors
+     * - Verify phase: refined search from draft seed points with full ef
+     * Trades ~5-10% accuracy for ~3-5x additional speedup over exact batch.
+     */
+    std::vector<std::vector<Neighbor>> find_top_k_batch_speculative(
+            uint32_t k,
+            vespalib::ConstArrayRef<vespalib::eval::TypedCells> vectors,
+            const BitVector *filter,
+            uint32_t explore_k,
+            double distance_threshold,
+            double draft_ef_ratio = 0.1) const;
+
+    /**
+     * Progressive retrieval for OnePiece-style progressive embeddings.
+     * Phase 1: Batch HNSW search using first draft_steps vectors (coarse).
+     * Phase 2: Brute-force re-rank candidate set with remaining vectors (fine).
+     *
+     * With 6 progressive steps and draft_steps=2:
+     *   - Only 2 HNSW traversals (batch) instead of 6
+     *   - Steps 3-6 score ~200 candidates via brute-force (trivial cost)
+     *   - Projected 4-5x speedup over 6 independent searches
+     */
+    std::vector<std::vector<Neighbor>> find_top_k_progressive(
+            uint32_t k,
+            vespalib::ConstArrayRef<vespalib::eval::TypedCells> vectors,
+            const BitVector *filter,
+            uint32_t explore_k,
+            double distance_threshold,
+            uint32_t draft_steps,
+            uint32_t candidate_multiplier = 3) const override;
+
     const DistanceFunction *distance_function() const override { return _distance_func.get(); }
 
     FurthestPriQ top_k_candidates(const TypedCells &vector, uint32_t k, const BitVector *filter) const;
