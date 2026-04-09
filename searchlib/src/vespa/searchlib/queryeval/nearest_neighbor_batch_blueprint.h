@@ -32,6 +32,8 @@ private:
     search::tensor::DistanceFunction::UP _fallback_dist_fun;
     const search::tensor::DistanceFunction *_dist_fun;
     bool _use_speculative;
+    bool _use_progressive;
+    uint32_t _progressive_draft_steps;
 
     // Union of all per-query results, deduplicated and sorted by docid.
     // Each entry stores (docid, min_distance_across_queries).
@@ -48,7 +50,9 @@ public:
                                   uint32_t explore_additional_hits,
                                   double distance_threshold,
                                   double brute_force_limit,
-                                  bool use_speculative = false);
+                                  bool use_speculative = false,
+                                  bool use_progressive = false,
+                                  uint32_t progressive_draft_steps = 2);
     NearestNeighborBatchBlueprint(const NearestNeighborBatchBlueprint&) = delete;
     NearestNeighborBatchBlueprint& operator=(const NearestNeighborBatchBlueprint&) = delete;
     ~NearestNeighborBatchBlueprint();

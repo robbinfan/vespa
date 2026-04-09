@@ -901,4 +901,67 @@ TEST_F(HnswBatchSearchTest, batch_search_with_identical_vectors)
 }
 
 
+TEST_F(HnswBatchSearchTest, progressive_retrieval_finds_results_for_all_steps)
+{
+    // Simulate progressive embeddings: similar vectors (slight perturbation).
+    auto qv1 = vectors.get_vector(1); // (2,2)
+    auto qv2 = vectors.get_vector(2); // (3,2) - nearby, like a progressive step
+    auto qv3 = vectors.get_vector(3); // (2,3) - nearby, like a progressive step
+    uint32_t k = 3;
+    double threshold = std::numeric_limits<double>::max();
+
+    std::vector<vespalib::eval::TypedCells> query_vecs = {qv1, qv2, qv3};
+
+    // Progressive: draft_steps=1, only qv1 does HNSW, qv2/qv3 re-rank candidates.
+    auto prog_results = index->find_top_k_progressive(k, query_vecs, nullptr, k, threshold, 1);
+
+    ASSERT_EQ(prog_results.size(), 3);
+    for (size_t q = 0; q < 3; ++q) {
+        EXPECT_FALSE(prog_results[q].empty())
+            << "Progressive step " << q << " should have results";
+        EXPECT_LE(prog_results[q].size(), k);
+    }
+
+    // Compare with full batch search — progressive should have reasonable overlap.
+    auto batch_results = index->find_top_k_batch(k, query_vecs, k, threshold);
+    for (size_t q = 0; q < 3; ++q) {
+        std::set<uint32_t> prog_docids, batch_docids;
+        for (const auto& n : prog_results[q]) prog_docids.insert(n.docid);
+        for (const auto& n : batch_results[q]) batch_docids.insert(n.docid);
+        int overlap = 0;
+        for (uint32_t d : prog_docids) {
+            if (batch_docids.count(d)) ++overlap;
+        }
+        // With such a small graph, progressive should find all the same results.
+        EXPECT_GE(overlap, 1) << "Progressive step " << q << " has poor recall vs batch";
+    }
+}
+
+TEST_F(HnswBatchSearchTest, progressive_with_filter)
+{
+    auto qv1 = vectors.get_vector(1);
+    auto qv2 = vectors.get_vector(2);
+    uint32_t k = 3;
+    double threshold = std::numeric_limits<double>::max();
+
+    // Filter: only even docids.
+    auto filter = BitVector::create(10);
+    filter->setBit(2);
+    filter->setBit(4);
+    filter->setBit(6);
+    filter->setBit(8);
+    filter->invalidateCachedCount();
+
+    std::vector<vespalib::eval::TypedCells> query_vecs = {qv1, qv2};
+    auto results = index->find_top_k_progressive(k, query_vecs, filter.get(), k, threshold, 1);
+
+    ASSERT_EQ(results.size(), 2);
+    for (size_t q = 0; q < 2; ++q) {
+        for (const auto& n : results[q]) {
+            EXPECT_TRUE(filter->testBit(n.docid))
+                << "Progressive step " << q << " returned filtered-out docid " << n.docid;
+        }
+    }
+}
+
 GTEST_MAIN_RUN_ALL_TESTS()

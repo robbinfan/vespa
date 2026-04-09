@@ -35,4 +35,23 @@ NearestNeighborIndex::find_top_k_batch_with_filter(
     return results;
 }
 
+std::vector<std::vector<NearestNeighborIndex::Neighbor>>
+NearestNeighborIndex::find_top_k_progressive(
+        uint32_t k,
+        vespalib::ConstArrayRef<vespalib::eval::TypedCells> vectors,
+        const BitVector *filter,
+        uint32_t explore_k,
+        double distance_threshold,
+        uint32_t draft_steps,
+        uint32_t) const
+{
+    // Default fallback: batch search all vectors (no progressive optimization).
+    // Subclasses with vector access (HnswIndex) override this for true progressive retrieval.
+    if (filter) {
+        return find_top_k_batch_with_filter(k, vectors, *filter, explore_k, distance_threshold);
+    }
+    (void)draft_steps;
+    return find_top_k_batch(k, vectors, explore_k, distance_threshold);
+}
+
 }

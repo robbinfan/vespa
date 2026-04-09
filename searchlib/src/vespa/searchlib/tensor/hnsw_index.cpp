@@ -20,6 +20,7 @@
 #include <vespa/vespalib/util/rcuvector.hpp>
 #include <vespa/vespalib/util/size_literals.h>
 #include <vespa/vespalib/util/time.h>
+#include <unordered_set>
 #include <vespa/log/log.h>
 
 LOG_SETUP(".searchlib.tensor.hnsw_index");
@@ -603,6 +604,81 @@ HnswIndex::find_top_k_batch_speculative(uint32_t k, vespalib::ConstArrayRef<vesp
         }
         std::sort(results[q].begin(), results[q].end(), NeighborsByDocId());
     }
+    return results;
+}
+
+std::vector<std::vector<NearestNeighborIndex::Neighbor>>
+HnswIndex::find_top_k_progressive(
+        uint32_t k,
+        vespalib::ConstArrayRef<vespalib::eval::TypedCells> vectors,
+        const BitVector *filter,
+        uint32_t explore_k,
+        double distance_threshold,
+        uint32_t draft_steps,
+        uint32_t candidate_multiplier) const
+{
+    const size_t num_vectors = vectors.size();
+    if (num_vectors == 0) {
+        return {};
+    }
+    if (draft_steps >= num_vectors) {
+        // All steps are draft → full batch search.
+        return top_k_by_docid_batch(k, vectors, filter, explore_k, distance_threshold);
+    }
+
+    // --- Phase 1: Batch HNSW search using draft (early step) vectors ---
+    uint32_t draft_k = k * candidate_multiplier;
+    auto draft_vectors = vespalib::ConstArrayRef<vespalib::eval::TypedCells>(vectors.data(), draft_steps);
+    auto draft_results = top_k_by_docid_batch(draft_k, draft_vectors, filter, explore_k, distance_threshold);
+
+    // Collect candidate union from draft results.
+    std::unordered_set<uint32_t> candidate_set;
+    for (const auto& hits : draft_results) {
+        for (const auto& hit : hits) {
+            candidate_set.insert(hit.docid);
+        }
+    }
+
+    // --- Phase 2: Brute-force re-rank candidates with ALL vectors ---
+    std::vector<std::vector<Neighbor>> results(num_vectors);
+
+    // Draft steps: take top-k from HNSW results.
+    for (size_t q = 0; q < draft_steps; ++q) {
+        auto& dr = draft_results[q];
+        std::sort(dr.begin(), dr.end(), [](const Neighbor& a, const Neighbor& b) {
+            return a.distance < b.distance;
+        });
+        if (dr.size() > k) {
+            dr.resize(k);
+        }
+        std::sort(dr.begin(), dr.end(), NeighborsByDocId());
+        results[q] = std::move(dr);
+    }
+
+    // Verify steps: brute-force distance over candidate set.
+    // This is cheap: ~200 candidates × distance calc ≈ trivial vs HNSW traversal.
+    for (size_t q = draft_steps; q < num_vectors; ++q) {
+        std::vector<Neighbor> scored;
+        scored.reserve(candidate_set.size());
+        for (uint32_t docid : candidate_set) {
+            if (filter && !filter->testBit(docid)) {
+                continue; // Skip filtered documents.
+            }
+            double dist = calc_distance(vectors[q], docid);
+            if (dist <= distance_threshold) {
+                scored.emplace_back(docid, dist);
+            }
+        }
+        std::sort(scored.begin(), scored.end(), [](const Neighbor& a, const Neighbor& b) {
+            return a.distance < b.distance;
+        });
+        if (scored.size() > k) {
+            scored.resize(k);
+        }
+        std::sort(scored.begin(), scored.end(), NeighborsByDocId());
+        results[q] = std::move(scored);
+    }
+
     return results;
 }
 

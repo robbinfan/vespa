@@ -254,6 +254,25 @@ public:
             double distance_threshold,
             double draft_ef_ratio = 0.1) const;
 
+    /**
+     * Progressive retrieval for OnePiece-style progressive embeddings.
+     * Phase 1: Batch HNSW search using first draft_steps vectors (coarse).
+     * Phase 2: Brute-force re-rank candidate set with remaining vectors (fine).
+     *
+     * With 6 progressive steps and draft_steps=2:
+     *   - Only 2 HNSW traversals (batch) instead of 6
+     *   - Steps 3-6 score ~200 candidates via brute-force (trivial cost)
+     *   - Projected 4-5x speedup over 6 independent searches
+     */
+    std::vector<std::vector<Neighbor>> find_top_k_progressive(
+            uint32_t k,
+            vespalib::ConstArrayRef<vespalib::eval::TypedCells> vectors,
+            const BitVector *filter,
+            uint32_t explore_k,
+            double distance_threshold,
+            uint32_t draft_steps,
+            uint32_t candidate_multiplier = 3) const override;
+
     const DistanceFunction *distance_function() const override { return _distance_func.get(); }
 
     FurthestPriQ top_k_candidates(const TypedCells &vector, uint32_t k, const BitVector *filter) const;

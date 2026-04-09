@@ -126,6 +126,29 @@ public:
             const BitVector &filter,
             uint32_t explore_k,
             double distance_threshold) const;
+
+    /**
+     * Progressive retrieval: use first draft_steps vectors for HNSW search,
+     * then brute-force re-rank the candidate set with all vectors.
+     * Designed for OnePiece-style progressive embeddings where early steps
+     * are coarse and later steps are fine-grained refinements.
+     *
+     * @param k            number of results per query vector
+     * @param vectors      all query vectors (progressive steps)
+     * @param filter       optional bitvector filter (nullptr = no filter)
+     * @param explore_k    ef parameter for HNSW search
+     * @param distance_threshold max distance threshold
+     * @param draft_steps  number of vectors to use for HNSW search (rest = re-rank only)
+     * @param candidate_multiplier  how many candidates to retrieve per draft query (multiplier of k)
+     */
+    virtual std::vector<std::vector<Neighbor>> find_top_k_progressive(
+            uint32_t k,
+            vespalib::ConstArrayRef<vespalib::eval::TypedCells> vectors,
+            const BitVector *filter,
+            uint32_t explore_k,
+            double distance_threshold,
+            uint32_t draft_steps,
+            uint32_t candidate_multiplier = 3) const;
 };
 
 }

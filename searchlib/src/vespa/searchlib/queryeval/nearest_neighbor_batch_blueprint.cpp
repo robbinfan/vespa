@@ -64,7 +64,9 @@ NearestNeighborBatchBlueprint::NearestNeighborBatchBlueprint(
         uint32_t explore_additional_hits,
         double distance_threshold,
         double brute_force_limit,
-        bool use_speculative)
+        bool use_speculative,
+        bool use_progressive,
+        uint32_t progressive_draft_steps)
     : ComplexLeafBlueprint(field),
       _attr_tensor(attr_tensor),
       _query_tensors(std::move(query_tensors)),
@@ -76,6 +78,8 @@ NearestNeighborBatchBlueprint::NearestNeighborBatchBlueprint(
       _fallback_dist_fun(),
       _dist_fun(nullptr),
       _use_speculative(use_speculative),
+      _use_progressive(use_progressive),
+      _progressive_draft_steps(progressive_draft_steps),
       _merged_hits(),
       _global_filter(GlobalFilter::create())
 {
@@ -163,7 +167,13 @@ NearestNeighborBatchBlueprint::perform_top_k_batch()
     uint32_t explore_k = k + _explore_additional_hits;
 
     std::vector<std::vector<search::tensor::NearestNeighborIndex::Neighbor>> per_query_hits;
-    if (_global_filter->has_filter()) {
+    if (_use_progressive && _query_tensors.size() > _progressive_draft_steps) {
+        // Progressive retrieval: draft steps do HNSW, rest re-rank candidates.
+        const BitVector *filter_ptr = _global_filter->has_filter() ? _global_filter->filter() : nullptr;
+        per_query_hits = nns_index->find_top_k_progressive(k, query_cells, filter_ptr,
+                                                           explore_k, _distance_threshold,
+                                                           _progressive_draft_steps);
+    } else if (_global_filter->has_filter()) {
         auto filter = _global_filter->filter();
         per_query_hits = nns_index->find_top_k_batch_with_filter(k, query_cells, *filter, explore_k, _distance_threshold);
     } else {
@@ -214,6 +224,10 @@ NearestNeighborBatchBlueprint::visitMembers(vespalib::ObjectVisitor& visitor) co
     visitor.visitBool("approximate", _approximate);
     visitor.visitInt("explore_additional_hits", _explore_additional_hits);
     visitor.visitBool("use_speculative", _use_speculative);
+    visitor.visitBool("use_progressive", _use_progressive);
+    if (_use_progressive) {
+        visitor.visitInt("progressive_draft_steps", _progressive_draft_steps);
+    }
 }
 
 bool
