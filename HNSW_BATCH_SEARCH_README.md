@@ -71,36 +71,57 @@ where batching adds overhead without saving vector loads.
 Adaptive batch **never degrades** below independent baseline — it automatically
 falls back to independent search when interests are spread.
 
-### Strategy 2: Progressive Retrieval (OnePiece)
+### Strategy 2: Adaptive Batch (OnePiece — Complementary Embeddings)
 
-**For**: OnePiece-style progressive embeddings where each step refines the same
-user representation (coarse → fine).
+**For**: OnePiece multi-embedding retrieval where each embedding captures a
+**different aspect** of the user's intent (complementary, not progressive).
+
+**Key discovery**: OnePiece embeddings are complementary, not progressive refinements.
+Each embedding captures a distinct aspect (brand affinity, style, price sensitivity,
+etc.). Ground-truth overlap between embeddings is near 0%, meaning each embedding
+retrieves almost entirely different documents.
 
 ```
-Progressive Retrieval:
-  Phase 1 (Draft):  Batch HNSW search using step 1-2 embeddings (coarse)
-                    → retrieve wider candidate set (3× k)
-  Phase 2 (Verify): Brute-force re-rank candidates using step 3-6 embeddings (fine)
-                    → trivial cost (~200 candidates × distance calc)
+Adaptive Batch (same as MIND):
+  1. Cluster the 6 query embeddings by similarity (dot product > 0.3)
+  2. Similar embeddings → batch search (shared visited set)
+  3. Dissimilar embeddings → independent single search
+  4. Union results across all groups
 ```
 
-**Key insight**: Progressive embeddings have 60%+ ground-truth overlap between steps.
-The first 2 steps already find most of the relevant candidates. Later steps only
-need to re-score a small candidate set, not traverse the full HNSW graph.
+**Benchmark results** (500K docs, 64-dim, 50 clusters, 6 complementary embeddings, 5 users):
 
-**Benchmark results** (500K docs, 64-dim, 6 progressive steps, 5 users):
+| Embedding Distribution    | Strategy       | VecLoads | Proj. Speedup | Recall |
+|---------------------------|----------------|----------|---------------|--------|
+| Concentrated (2 aspects)  | Adaptive Batch | 21797    | **1.3×**      | 0.990  |
+| Mixed (3 aspects)         | Adaptive Batch | 24086    | **1.2×**      | 0.995  |
+| Spread (6 aspects)        | Adaptive Batch | 32420    | **1.0×**      | 0.950  |
 
-| Method                    | VecLoads | Proj. Speedup | Recall |
-|---------------------------|----------|---------------|--------|
-| Independent (6× single)  | 40073    | 1.0×          | 0.943  |
-| Batch (all 6 steps)      | 9036     | **3.6×**      | 0.983  |
-| Progressive (draft=2)    | 8506     | **4.5×**      | 0.965  |
-| Progressive (draft=3)    | 8996     | **4.1×**      | 0.983  |
+**Why Progressive Retrieval FAILS for complementary embeddings**:
 
-Progressive retrieval is the clear winner for OnePiece:
-- **4.5× projected speedup** with draft=2 (8× CPU → ~1.8× CPU)
-- **Recall improves** because batch search lets adjacent steps help each other
-- Re-rank phase adds negligible cost (~200 brute-force distance calcs)
+Progressive retrieval (draft=2, verify=4) assumes early embeddings contain most
+relevant candidates. With complementary embeddings, each embedding retrieves
+different documents — draft with 2 embeddings only finds candidates for 2 out of
+6 aspects. Result: **recall drops to 0.33-0.51** (catastrophic).
+
+| Method             | Concentrated | Mixed  | Spread |
+|--------------------|-------------|--------|--------|
+| Independent        | 0.985       | 0.988  | 0.950  |
+| Adaptive Batch     | **0.990**   | **0.995** | **0.950** |
+| Progressive (d=2)  | 0.347       | 0.337  | 0.325  |
+
+**Why Full Batch can be SLOWER for spread embeddings**:
+
+Full batch (unified queue) exploring 6 dissimilar directions visits too many nodes.
+In spread configuration: 285K distance calcs vs 32K for independent → **0.5× speed
+(slower than baseline)**. Adaptive Batch avoids this by falling back to independent.
+
+**Why optimization headroom is limited for complementary embeddings**:
+
+With ~0% ground truth overlap, the 6 embeddings explore nearly disjoint graph regions.
+Shared visited set provides minimal savings because few nodes are shared across
+queries. This is fundamentally different from MIND concentrated interests where
+many interests share the same graph region.
 
 ### Strategy 3: Speculative Search (Experimental)
 
@@ -187,9 +208,13 @@ NearestNeighborBatchBlueprint(field, attr_tensor, query_tensors,
 | Parameter                 | MIND Setting          | OnePiece Setting          |
 |---------------------------|-----------------------|---------------------------|
 | `use_speculative`         | `false`               | `false`                   |
-| `use_progressive`         | `false`               | **`true`**                |
-| `progressive_draft_steps` | N/A                   | **`2`** (or `3`)          |
-| Strategy used             | Adaptive Batch        | Progressive Retrieval     |
+| `use_progressive`         | `false`               | `false` (complementary)   |
+| `progressive_draft_steps` | N/A                   | N/A                       |
+| Strategy used             | Adaptive Batch        | Adaptive Batch            |
+
+**Note**: Progressive retrieval (`use_progressive=true`) is only appropriate when
+embeddings are truly progressive refinements (coarse → fine). For OnePiece's
+complementary embeddings, use the default Adaptive Batch path (`use_progressive=false`).
 
 ## Cost Model
 
@@ -220,21 +245,39 @@ Spread (10 clusters):       10× CPU       10× CPU         1.0× (no penalty)
 
 Most real MIND users fall in concentrated/mixed → **expected 1.5×-3.6× speedup**.
 
-### OnePiece (6 progressive steps)
+### OnePiece (6 complementary embeddings)
+
+OnePiece embeddings are **complementary** (each captures a different aspect),
+with near-zero ground truth overlap between embeddings. This limits optimization
+headroom compared to MIND:
 
 ```
-Current:     6 × independent HNSW = 8× single-query CPU (measured)
-Progressive: 2 batch HNSW + 4 brute-force re-rank = ~1.8× CPU
-Improvement: ~4.5× speedup (8× → 1.8×)
+                         Independent    Adaptive Batch    Speedup
+Concentrated (2 aspects):  8× CPU        ~6.2× CPU        1.3×
+Mixed (3 aspects):         8× CPU        ~6.7× CPU        1.2×
+Spread (6 aspects):        8× CPU        8× CPU            1.0× (no penalty)
 ```
 
-### OnePiece with Filter
+**Important**: Progressive retrieval is NOT applicable — recall drops to 0.33 because
+draft embeddings cannot represent other aspects' candidates.
+
+The modest speedup (1.0-1.3×) reflects the fundamental constraint: complementary
+embeddings explore disjoint graph regions, so shared visited set provides minimal
+benefit. Real-world improvement depends on how much overlap exists between the
+actual OnePiece embeddings — if some aspects are correlated in practice, speedup
+could be higher.
+
+### Filter Savings (both MIND and OnePiece)
+
+Even when vector load savings are modest, batch search still saves on filter
+evaluation:
 
 ```
-Current:     6 × (HNSW + filter eval) = 8× + filter overhead
-Progressive: 2 × (HNSW + filter eval) + 4 × (brute-force, trivial filter)
-Improvement: ~5× (filter checked on fewer nodes + fewer HNSW traversals)
+                     Independent (6 queries)    Adaptive Batch    Saving
+Filter checks/node:        6×                      1×              6×
 ```
+
+For restrictive filters (category + region), this alone may justify batch search.
 
 ## Failed Optimization Attempts (MIND)
 
