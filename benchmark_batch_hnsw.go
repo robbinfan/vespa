@@ -888,8 +888,20 @@ func main() {
 
 	// === Run benchmarks: 5 random users per distribution for statistics ===
 	const NUM_USERS = 5
-	const cacheMissNs = 40.0 // L3 cache miss latency
-	const distCalcNs = 2.0   // 64-dim inner product distance calc time
+	const distCalcNs = 2.0 // 64-dim inner product distance calc time (compute-bound, stable)
+
+	// Cost scenarios: not every vecLoad is a cold L3 miss.
+	// HNSW graph traversal has temporal/spatial locality; independent searches
+	// also benefit from cache warmth across sequential queries.
+	type CostScenario struct {
+		Name      string
+		VecLoadNs float64
+	}
+	costScenarios := []CostScenario{
+		{"Cold (40ns)", 40.0},   // All L3 misses (worst case, first access)
+		{"Mixed (15ns)", 15.0},  // Realistic mix of L2/L3 hits and misses
+		{"Warm (5ns)", 5.0},     // Mostly cache hits (repeated access patterns)
+	}
 
 	type MethodDef struct {
 		Name       string
@@ -989,24 +1001,40 @@ func main() {
 		}
 
 		baseline := avgResults[0]
-		baselineCost := baseline.VecLoads*cacheMissNs + baseline.DistCalcs*distCalcNs
 
+		// Raw counters table
 		fmt.Println()
-		fmt.Printf("  %-30s %8s %10s %10s %10s %10s %10s\n",
-			"Method", "Recall", "UnionRec", "DistCalcs", "VecLoads", "Sim.Speed", "Proj.Speed")
-		fmt.Println("  " + repeatStr("-", 98))
+		fmt.Printf("  %-30s %8s %10s %10s %10s %8s %8s\n",
+			"Method", "Recall", "UnionRec", "DistCalcs", "VecLoads", "DC.Red", "VL.Red")
+		fmt.Println("  " + repeatStr("-", 94))
 
 		for _, r := range avgResults {
-			simSpeedup := baseline.TimeMs / r.TimeMs
-			projCost := r.VecLoads*cacheMissNs + r.DistCalcs*distCalcNs
-			projSpeedup := baselineCost / projCost
-			fmt.Printf("  %-30s %8.4f %10.4f %10.0f %10.0f %9.1fx %9.1fx\n",
-				r.Name, r.AvgRecall, r.UnionRec, r.DistCalcs, r.VecLoads, simSpeedup, projSpeedup)
+			dcRed := baseline.DistCalcs / r.DistCalcs
+			vlRed := baseline.VecLoads / r.VecLoads
+			fmt.Printf("  %-30s %8.4f %10.4f %10.0f %10.0f %7.1fx %7.1fx\n",
+				r.Name, r.AvgRecall, r.UnionRec, r.DistCalcs, r.VecLoads, dcRed, vlRed)
 		}
 
-		fmt.Printf("\n  VecLoad reduction (batch): %.1fx  |  Adaptive batch proj. speedup: %.1fx\n",
-			baseline.VecLoads/avgResults[1].VecLoads,
-			baselineCost/(avgResults[2].VecLoads*cacheMissNs+avgResults[2].DistCalcs*distCalcNs))
+		// Projected speedup under different cache assumptions
+		fmt.Println()
+		fmt.Printf("  Projected speedup under different cache hit assumptions:\n")
+		fmt.Printf("  %-30s", "Method")
+		for _, cs := range costScenarios {
+			fmt.Printf(" %12s", cs.Name)
+		}
+		fmt.Println()
+		fmt.Print("  " + repeatStr("-", 30+13*len(costScenarios)))
+		fmt.Println()
+
+		for _, r := range avgResults {
+			fmt.Printf("  %-30s", r.Name)
+			for _, cs := range costScenarios {
+				baseCost := baseline.VecLoads*cs.VecLoadNs + baseline.DistCalcs*distCalcNs
+				methCost := r.VecLoads*cs.VecLoadNs + r.DistCalcs*distCalcNs
+				fmt.Printf(" %11.1fx", baseCost/methCost)
+			}
+			fmt.Println()
+		}
 	}
 
 	// === Final summary ===
@@ -1015,33 +1043,28 @@ func main() {
 	fmt.Println("COST MODEL & CONCLUSIONS")
 	fmt.Println("================================================================================")
 	fmt.Println()
-	fmt.Println("  Cost model (real HNSW is memory-bandwidth bound):")
-	fmt.Println("    Vector load (L3 cache miss):  ~40ns (256 bytes random access)")
-	fmt.Println("    Distance calc (64-dim IP):    ~2ns  (sequential arithmetic)")
-	fmt.Println("    Ratio: 20:1 → vector loads dominate real-world cost")
+	fmt.Println("  Cost model assumptions:")
+	fmt.Println("    Distance calc (64-dim IP):  ~2ns   (compute-bound, stable)")
+	fmt.Println("    Vector load cost depends on cache hit rate:")
+	fmt.Println("      Cold (L3 miss):           ~40ns  (first access, random 256B read)")
+	fmt.Println("      Mixed (L2/L3 hit mix):    ~15ns  (realistic HNSW traversal)")
+	fmt.Println("      Warm (mostly L2 hits):    ~5ns   (hot graph region)")
 	fmt.Println()
-	fmt.Println("  RESULTS SUMMARY:")
-	fmt.Println("  ┌────────────────────┬───────────┬──────────┬──────────────────────┐")
-	fmt.Println("  │ Interest Dist.     │ VecLoads↓ │ Recall   │ Proj. Speedup        │")
-	fmt.Println("  ├────────────────────┼───────────┼──────────┼──────────────────────┤")
-	fmt.Println("  │ Concentrated (2cl) │ 4.3x      │ = or +   │ Batch: 3.1x  Ada: 3.6x │")
-	fmt.Println("  │ Mixed (3+3+4)      │ 1.7x      │ = or +   │ Batch: 1.2x  Ada: 1.5x │")
-	fmt.Println("  │ Spread (10cl)      │ 1.1x      │ =        │ Batch: 0.8x  Ada: 1.0x │")
-	fmt.Println("  └────────────────────┴───────────┴──────────┴──────────────────────┘")
+	fmt.Println("  The projected speedup RANGE (cold→warm) reflects uncertainty in")
+	fmt.Println("  actual cache behavior. Real production speedup depends on:")
+	fmt.Println("    - Dataset size vs cache capacity (L3 size)")
+	fmt.Println("    - Graph connectivity and traversal locality")
+	fmt.Println("    - Concurrent query load (cache contention)")
 	fmt.Println()
 	fmt.Println("  RECOMMENDATION: Use Adaptive Batch (auto-cluster nearby interests)")
 	fmt.Println("    - Never worse than independent baseline (safe default)")
-	fmt.Println("    - Up to 3.6x speedup when interests cluster (common in MIND)")
+	fmt.Println("    - VecLoad reduction is the reliable metric (independent of cost model)")
 	fmt.Println("    - Zero accuracy loss in all tested configurations")
 	fmt.Println()
 	fmt.Println("  WHY SPECULATIVE DOESN'T HELP (at 100K scale):")
 	fmt.Println("    - Verify phase batch re-computes N distances per seed node")
 	fmt.Println("    - Draft savings don't offset verify overhead")
 	fmt.Println("    - May help at larger scale (500K+) where entry descent is costly")
-	fmt.Println()
-	fmt.Println("  NOTE: Go simulation 'Sim.Speed' is misleading because:")
-	fmt.Println("    - Go hash map is O(1) per lookup, masking cache-miss costs")
-	fmt.Println("    - 'Proj.Speed' uses cost model weights to project real-world benefit")
 }
 
 func repeatStr(s string, n int) string {

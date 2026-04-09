@@ -1,8 +1,14 @@
 # HNSW Multi-Embedding Batch Search Optimization
 
 Optimized HNSW index search for scenarios where multiple query embeddings target
-the same tensor field — specifically **MIND** (Multi-Interest Network with Dynamic
-Routing) and **OnePiece** progressive embedding retrieval.
+the same tensor field. Two specific use cases:
+
+- **MIND** (Multi-Interest Network with Dynamic Routing): User has ~10 interest
+  embeddings. Each represents a different purchasing interest (e.g., shoes, electronics,
+  books). Query retrieves candidates per interest, then OR-merges and re-ranks.
+- **OnePiece**: User has 6 **complementary** embeddings, each capturing a different
+  aspect of search intent (brand affinity, style, price sensitivity, etc.).
+  Not progressive refinements — each embedding retrieves largely disjoint documents.
 
 ## Problem
 
@@ -22,10 +28,10 @@ OR(
 Each runs a full HNSW traversal **serially**:
 - 10 × independent entry point descent
 - 10 × independent visited set allocation
-- 10 × independent vector loads (L3 cache misses at ~40ns each)
+- 10 × independent vector loads (cache misses)
 - Same document vectors loaded multiple times across queries
 
-For OnePiece with 6 progressive embeddings, the measured cost is **8× single-query
+For OnePiece with 6 complementary embeddings, the measured cost is **8× single-query
 CPU** (not 6× — the extra overhead comes from cache thrashing between independent
 traversals).
 
@@ -62,11 +68,14 @@ where batching adds overhead without saving vector loads.
 
 **Benchmark results** (100K docs, 64-dim, 50 clusters, 10 interests, averaged over 5 users):
 
-| Interest Distribution    | Strategy         | VecLoads | Proj. Speedup | Recall |
-|--------------------------|------------------|----------|---------------|--------|
-| Concentrated (2 clusters)| Adaptive Batch   | 5253     | **3.6×**      | 0.996  |
-| Mixed (3+3+4)            | Adaptive Batch   | 14337    | **1.5×**      | 0.997  |
-| Spread (10 clusters)     | Adaptive Batch   | 22623    | **1.0×**      | 0.997  |
+| Interest Distribution    | Strategy       | VL Reduction | Speedup Range¹ | Recall |
+|--------------------------|----------------|-------------|-----------------|--------|
+| Concentrated (2 clusters)| Adaptive Batch | **3.6×**    | 3.6×→2.4×→1.5× | 0.996  |
+| Mixed (3+3+4)            | Adaptive Batch | **1.5×**    | 1.5×→1.3×→1.1× | 0.997  |
+| Spread (10 clusters)     | Adaptive Batch | **1.0×**    | 1.0×→1.0×→1.0× | 0.997  |
+
+¹ Speedup range: cold cache (40ns/load) → mixed (15ns) → warm (5ns). VL Reduction
+is the reliable metric (cache-independent).
 
 Adaptive batch **never degrades** below independent baseline — it automatically
 falls back to independent search when interests are spread.
@@ -91,11 +100,13 @@ Adaptive Batch (same as MIND):
 
 **Benchmark results** (500K docs, 64-dim, 50 clusters, 6 complementary embeddings, 5 users):
 
-| Embedding Distribution    | Strategy       | VecLoads | Proj. Speedup | Recall |
-|---------------------------|----------------|----------|---------------|--------|
-| Concentrated (2 aspects)  | Adaptive Batch | 21797    | **1.3×**      | 0.990  |
-| Mixed (3 aspects)         | Adaptive Batch | 24086    | **1.2×**      | 0.995  |
-| Spread (6 aspects)        | Adaptive Batch | 32420    | **1.0×**      | 0.950  |
+| Embedding Distribution    | Strategy       | VL Reduction | Speedup Range¹ | Recall |
+|---------------------------|----------------|-------------|-----------------|--------|
+| Concentrated (2 aspects)  | Adaptive Batch | **1.5×**    | 1.3×→1.1×→1.0× | 0.990  |
+| Mixed (3 aspects)         | Adaptive Batch | **1.3×**    | 1.2×→1.1×→1.0× | 0.995  |
+| Spread (6 aspects)        | Adaptive Batch | **1.0×**    | 1.0×→1.0×→1.0× | 0.950  |
+
+¹ Speedup range: cold cache (40ns/load) → mixed (15ns) → warm (5ns).
 
 **Why Progressive Retrieval FAILS for complementary embeddings**:
 
@@ -135,25 +146,64 @@ is a significant cost.
 
 ## Architecture
 
-### C++ Implementation
+### Overview
 
 ```
-nearest_neighbor_index.h       // Virtual base: find_top_k_batch, find_top_k_progressive
-├── hnsw_index.h/cpp           // Core implementation:
-│   ├── search_layer_batch_helper  // Shared visited set + batch distance
-│   ├── search_layer_batch         // Visited tracker selection (BitVector/HashSet)
-│   ├── top_k_candidates_batch     // Shared entry point descent
-│   ├── find_top_k_batch           // Public batch search API
-│   ├── find_top_k_progressive     // Progressive: draft HNSW + verify re-rank
-│   └── find_top_k_batch_speculative // Speculative draft/verify
-│
-├── hnsw_index_utils.h         // BatchHnswCandidate, BatchNearestPriQ
-│
-└── nearest_neighbor_batch_blueprint.h/cpp  // Query evaluation layer
-    ├── perform_top_k_batch()      // Calls batch/progressive based on config
-    ├── set_global_filter()        // Filter-aware, brute-force fallback
-    └── createLeafSearch()         // Returns NnsIndexIterator over merged hits
+Query Layer (Blueprint)                    Index Layer (HnswIndex)
+─────────────────────                      ────────────────────────
+                                           nearest_neighbor_index.h
+                                           ├── find_top_k_batch()         [virtual]
+                                           ├── find_top_k_batch_with_filter()
+                                           └── find_top_k_progressive()
+                                                      │
+intermediate_blueprints.cpp                            │ override
+├── OrBlueprint::optimize_self()           hnsw_index.h/cpp
+│   └── try_optimize_batch_nn()            ├── search_layer_batch_helper  [core: shared visited + batch dist]
+│       (detect N same-field NN queries    ├── search_layer_batch         [VisitedTracker selection]
+│        → merge into 1 batch blueprint)   ├── top_k_candidates_batch     [shared entry point descent]
+│                                          ├── find_top_k_batch           [public API → top_k_by_docid_batch]
+nearest_neighbor_batch_blueprint.h/cpp     ├── find_top_k_progressive     [draft HNSW + verify re-rank]
+├── perform_top_k_batch()                  └── find_top_k_batch_speculative [draft/verify, experimental]
+│   (calls batch/progressive/speculative)
+├── set_global_filter()                    hnsw_index_utils.h
+│   (filter-aware, brute-force fallback)   ├── BatchHnswCandidate {docid, node_ref, min_distance}
+└── createLeafSearch()                     └── BatchNearestPriQ (ordered by min_distance)
+    (NnsIndexIterator over merged hits)
 ```
+
+### Query Detection & Rewriting
+
+`OrBlueprint::optimize_self()` in `intermediate_blueprints.cpp` detects when
+multiple children are `NearestNeighborBlueprint` targeting the **same** tensor
+attribute (matched by `ITensorAttribute*` pointer). When 2+ NN queries target the
+same field, it extracts their query tensors, removes the individual NN blueprints,
+and inserts a single `NearestNeighborBatchBlueprint` holding all query tensors.
+
+```
+Before:  OR(NN(field, q1), NN(field, q2), ..., NN(field, qN), other_children...)
+After:   OR(NNBatch(field, [q1..qN]), other_children...)
+```
+
+### Core Algorithm: `search_layer_batch_helper`
+
+The batch search algorithm in `hnsw_index.cpp`:
+
+1. **Shared entry point descent**: Navigate upper HNSW levels once using the first
+   query vector. All queries start from the same entry point at level 0.
+
+2. **Unified candidate queue**: A single `BatchNearestPriQ` ordered by `min_distance`
+   (minimum distance across all queries). This ensures nodes promising for ANY query
+   are explored first.
+
+3. **Per-query result tracking**: Each query maintains its own `FurthestPriQ` of
+   best-k results and a `limit_dist` threshold. A candidate is useful if its distance
+   to any query is below that query's limit.
+
+4. **Global pruning**: Stop when the candidate's `min_distance` exceeds ALL queries'
+   limits (i.e., no query can benefit from further exploration).
+
+5. **Filter-once**: When a filter bitvector is present, each node is checked against
+   the filter exactly once (not N times).
 
 ### Batch Distance Computation
 
@@ -168,12 +218,18 @@ for (size_t q = 0; q < num_queries; ++q) {
 }
 ```
 
-Independent search loads the same vector N times (N cache misses at ~40ns each).
-Batch search loads it once (1 cache miss) and computes N distances (~2ns each).
+Independent search loads the same vector N times. Batch search loads it once
+and computes N distances (~2ns each).
 
-**Saving per shared node**: `(N-1) × 40ns - (N-1) × 2ns ≈ (N-1) × 38ns`
+**Saving per shared node**: `(N-1) × vecLoadCost - (N-1) × 2ns`
 
-For N=10 interests: **342ns saved per shared visited node**.
+| Cache scenario | vecLoad | Saving/node (N=10) | Load:Calc ratio |
+|----------------|---------|-------------------|-----------------|
+| Cold (L3 miss) | 40ns    | 342ns             | 20:1            |
+| Mixed          | 15ns    | 117ns             | 7.5:1           |
+| Warm (L2 hit)  | 5ns     | 27ns              | 2.5:1           |
+
+Real-world saving depends on dataset size vs L3 cache capacity.
 
 ### Filter Handling
 
@@ -187,6 +243,36 @@ Batch search evaluates filters once per unique node (not N times):
 
 For restrictive filters (e.g., category + region), the filter bitvector check
 savings alone can be significant.
+
+### Result Merging in Blueprint
+
+`NearestNeighborBatchBlueprint::perform_top_k_batch()` calls the appropriate
+index method, then merges per-query results:
+
+```cpp
+// Union of all per-query results, keeping min distance per docid
+std::unordered_map<uint32_t, double> doc_to_min_dist;
+for (const auto& hits : per_query_hits) {
+    for (const auto& hit : hits) {
+        auto it = doc_to_min_dist.find(hit.docid);
+        if (it == doc_to_min_dist.end())
+            doc_to_min_dist.emplace(hit.docid, hit.distance);
+        else
+            it->second = std::min(it->second, hit.distance);
+    }
+}
+// Sort by docid for deterministic iterator output
+```
+
+Each document's score = **min distance across all query vectors** (best match among
+interests/aspects). The merged hits are delivered via `NnsIndexIterator`.
+
+### Global Filter Handling in Blueprint
+
+`set_global_filter()` determines the search strategy:
+1. If filter passes too few docs (`max_hit_ratio < brute_force_limit`) → fall back
+   to brute-force (disable approximate search)
+2. Otherwise → pass filter bitvector to batch search, which checks it once per node
 
 ## Configuration
 
@@ -218,18 +304,29 @@ complementary embeddings, use the default Adaptive Batch path (`use_progressive=
 
 ## Cost Model
 
-Real-world HNSW search is **memory-bandwidth bound**, not compute-bound:
+Real-world HNSW search is **memory-bandwidth bound**, not compute-bound.
+However, not every vector load is a cold L3 cache miss — HNSW graph traversal
+has temporal/spatial locality, and independent searches also benefit from cache
+warmth across sequential queries.
 
-| Operation                  | Latency | Notes                          |
-|----------------------------|---------|--------------------------------|
-| Vector load (L3 miss)     | ~40ns   | 256 bytes random access        |
-| Distance calc (64-dim IP) | ~2ns    | Sequential arithmetic (SIMD)   |
-| Filter bitvector check    | ~1ns    | Usually in L1 cache            |
+| Operation                  | Latency   | Notes                               |
+|----------------------------|-----------|--------------------------------------|
+| Vector load (L3 miss)     | ~40ns     | Cold access, random 256B read        |
+| Vector load (L3 hit)      | ~15ns     | Realistic HNSW traversal mix         |
+| Vector load (L2 hit)      | ~5ns      | Hot graph region, repeated access    |
+| Distance calc (64-dim IP) | ~2ns      | Compute-bound, stable                |
+| Filter bitvector check    | ~1ns      | Usually in L1 cache                  |
 
-The **20:1 ratio** between vector load and distance calc means reducing vector
-loads is the primary optimization lever. Batch search targets exactly this.
+The ratio between vector load and distance calc ranges from **2.5:1** (warm cache)
+to **20:1** (cold cache). Projected speedup is given as a **range** in the
+benchmarks, not a single number. The reliable metric is the raw **VecLoad reduction
+ratio**, which is independent of cache assumptions.
 
 ## Projected Production Impact
+
+Projected speedup depends on the cache hit rate assumption. The table below shows
+a range from cold cache (worst case, 40ns/load) to warm cache (best case, 5ns/load).
+The **VecLoad reduction** column is cache-independent and reliable.
 
 ### MIND (10 interests)
 
@@ -237,13 +334,13 @@ Performance depends on interest distribution — real users typically have 1-3 d
 interest categories, making concentrated/mixed the common case:
 
 ```
-                         Independent    Adaptive Batch    Speedup
-Concentrated (2 clusters):  10× CPU       ~2.8× CPU       3.6×
-Mixed (3+3+4):              10× CPU       ~6.7× CPU       1.5×
-Spread (10 clusters):       10× CPU       10× CPU         1.0× (no penalty)
+                          VecLoad Red.   Speedup Range (cold → mixed → warm)
+Concentrated (2 clusters):   3.6×        3.6× → 2.4× → 1.5×
+Mixed (3+3+4):               1.5×        1.5× → 1.3× → 1.1×
+Spread (10 clusters):        1.0×        1.0× → 1.0× → 1.0× (no penalty)
 ```
 
-Most real MIND users fall in concentrated/mixed → **expected 1.5×-3.6× speedup**.
+Most real MIND users fall in concentrated/mixed.
 
 ### OnePiece (6 complementary embeddings)
 
@@ -252,20 +349,20 @@ with near-zero ground truth overlap between embeddings. This limits optimization
 headroom compared to MIND:
 
 ```
-                         Independent    Adaptive Batch    Speedup
-Concentrated (2 aspects):  8× CPU        ~6.2× CPU        1.3×
-Mixed (3 aspects):         8× CPU        ~6.7× CPU        1.2×
-Spread (6 aspects):        8× CPU        8× CPU            1.0× (no penalty)
+                          VecLoad Red.   Speedup Range (cold → mixed → warm)
+Concentrated (2 aspects):   1.5×         1.3× → 1.1× → 1.0×
+Mixed (3 aspects):          1.3×         1.2× → 1.1× → 1.0×
+Spread (6 aspects):         1.0×         1.0× → 1.0× → 1.0× (no penalty)
 ```
 
 **Important**: Progressive retrieval is NOT applicable — recall drops to 0.33 because
 draft embeddings cannot represent other aspects' candidates.
 
-The modest speedup (1.0-1.3×) reflects the fundamental constraint: complementary
-embeddings explore disjoint graph regions, so shared visited set provides minimal
-benefit. Real-world improvement depends on how much overlap exists between the
-actual OnePiece embeddings — if some aspects are correlated in practice, speedup
-could be higher.
+The modest VecLoad reduction (1.0-1.5×) reflects the fundamental constraint:
+complementary embeddings explore disjoint graph regions, so shared visited set
+provides minimal benefit. Real-world improvement depends on how much overlap exists
+between the actual OnePiece embeddings — if some aspects are correlated in practice,
+the VecLoad reduction (and thus speedup) could be higher.
 
 ### Filter Savings (both MIND and OnePiece)
 
@@ -374,26 +471,84 @@ Further MIND performance gains require **system-level** optimizations:
 
 ## Files Changed
 
+### C++ Core (searchlib)
+
 | File | Change |
 |------|--------|
-| `searchlib/.../tensor/nearest_neighbor_index.h` | Added `find_top_k_batch`, `find_top_k_batch_with_filter`, `find_top_k_progressive` virtual methods |
-| `searchlib/.../tensor/nearest_neighbor_index.cpp` | Default implementations (fallback to per-vector) |
-| `searchlib/.../tensor/hnsw_index.h` | Batch/progressive search method declarations |
-| `searchlib/.../tensor/hnsw_index.cpp` | Core batch search, speculative, progressive implementations |
-| `searchlib/.../tensor/hnsw_index_utils.h` | `BatchHnswCandidate`, `BatchNearestPriQ` types |
-| `searchlib/.../queryeval/nearest_neighbor_batch_blueprint.h/cpp` | Query evaluation layer for batch/progressive |
-| `searchlib/.../queryeval/CMakeLists.txt` | Added batch blueprint source |
-| `searchlib/.../queryeval/intermediate_blueprints.cpp` | OR optimization to detect same-field NN queries |
-| `searchlib/src/tests/tensor/hnsw_index/hnsw_index_test.cpp` | Batch and progressive search tests |
-| `benchmark_batch_hnsw.go` | MIND benchmark (100K docs, 3 interest distributions) |
-| `benchmark_onepiece_hnsw.go` | OnePiece benchmark (500K docs, progressive embeddings) |
+| `.../tensor/nearest_neighbor_index.h` | Added `find_top_k_batch`, `find_top_k_batch_with_filter`, `find_top_k_progressive` virtual methods |
+| `.../tensor/nearest_neighbor_index.cpp` | Default fallback implementations (loop calling single-vector `find_top_k`) |
+| `.../tensor/hnsw_index.h` | Batch/progressive/speculative method declarations + private helpers |
+| `.../tensor/hnsw_index.cpp` | Core implementations: `search_layer_batch_helper` (shared visited + batch dist), `top_k_candidates_batch`, `find_top_k_batch`, `find_top_k_progressive`, `find_top_k_batch_speculative` |
+| `.../tensor/hnsw_index_utils.h` | `BatchHnswCandidate` (min_distance across queries), `BatchNearestPriQ` |
+| `.../queryeval/nearest_neighbor_batch_blueprint.h` | `NearestNeighborBatchBlueprint` class: holds N query tensors, merged results |
+| `.../queryeval/nearest_neighbor_batch_blueprint.cpp` | `perform_top_k_batch()`, `set_global_filter()`, `createLeafSearch()`, cell type conversion |
+| `.../queryeval/CMakeLists.txt` | Added `nearest_neighbor_batch_blueprint.cpp` |
+| `.../queryeval/intermediate_blueprints.cpp` | `try_optimize_batch_nn()` in `OrBlueprint::optimize_self()` — detects same-field NN queries |
+
+### Tests
+
+| File | Change |
+|------|--------|
+| `searchlib/src/tests/tensor/hnsw_index/hnsw_index_test.cpp` | 7 test cases: batch vs independent consistency, batch with filter, single-vector batch, speculative recall, identical vectors, progressive retrieval, progressive with filter |
+
+### Benchmarks (Go)
+
+| File | Description |
+|------|-------------|
+| `benchmark_batch_hnsw.go` | MIND benchmark: 100K docs, 64-dim, 50 clusters, 10 interests, 3 distributions (concentrated/mixed/spread), 4 methods (independent/batch/adaptive/speculative) |
+| `benchmark_onepiece_hnsw.go` | OnePiece benchmark: 500K docs, 64-dim, 6 complementary embeddings, 3 distributions, 4 methods (independent/batch/adaptive/progressive) |
 
 ## Benchmark Reproduction
 
 ```bash
-# MIND multi-interest benchmark
+# MIND multi-interest benchmark (~2min on modern hardware)
 go run benchmark_batch_hnsw.go
 
-# OnePiece progressive retrieval benchmark
+# OnePiece complementary embedding benchmark (~15min, 500K graph build)
 go run benchmark_onepiece_hnsw.go
 ```
+
+Both benchmarks output:
+- Raw counters: VecLoads, DistCalcs, VL/DC reduction ratios
+- Projected speedup under 3 cache scenarios (cold 40ns / mixed 15ns / warm 5ns)
+- Per-query and union recall vs brute-force ground truth
+
+## Key Design Decisions
+
+1. **Unified queue + shared visited set**: The ONLY working combination. Per-query
+   queues + shared visited set is fundamentally broken (see Failed Attempts §3).
+   The unified queue ensures all queries share the exploration frontier.
+
+2. **Adaptive clustering**: Auto-groups similar queries (dot product > 0.3) for
+   batching, falls back to independent for dissimilar queries. This guarantees
+   no regression vs baseline.
+
+3. **VecLoad reduction as primary metric**: Projected speedup depends on cache
+   assumptions (2.5:1 to 20:1 load:calc ratio). VecLoad reduction is the cache-
+   independent metric that translates to real savings.
+
+4. **Complementary ≠ progressive**: OnePiece embeddings are complementary (each
+   captures a different aspect with ~0% ground truth overlap). Progressive retrieval
+   (draft/verify) is catastrophically wrong for this case (recall → 0.33).
+
+5. **Backwards compatible**: Default implementations in base class fall back to
+   per-vector loops. Existing single-query paths are untouched.
+
+## Next Steps for Production Validation
+
+1. **Measure real embedding similarity**: Run dot-product analysis on actual MIND/OnePiece
+   embeddings to determine which distribution case (concentrated/mixed/spread) applies.
+   This determines the expected VecLoad reduction.
+
+2. **Profile actual cache behavior**: Use `perf stat` to measure L2/L3 miss rates
+   during HNSW search. This determines where in the cold→warm range the real system
+   operates, and thus the actual speedup.
+
+3. **Test with real filters**: Filter amplification savings (N× → 1× filter checks
+   per node) are independent of cache assumptions and may be the largest win in
+   restrictive filter scenarios.
+
+4. **System-level optimizations** (if algorithmic ceiling is reached):
+   - Thread-level parallelism for interest groups
+   - SIMD batch distance computation
+   - Memory prefetching during graph traversal

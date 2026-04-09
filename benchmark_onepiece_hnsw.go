@@ -630,8 +630,17 @@ func main() {
 		INTER_GROUP_SIGMA = float32(0.15) // noise within each aspect group
 	)
 
-	const cacheMissNs = 40.0
 	const distCalcNs = 2.0
+
+	type CostScenario struct {
+		Name      string
+		VecLoadNs float64
+	}
+	costScenarios := []CostScenario{
+		{"Cold(40ns)", 40.0},
+		{"Mixed(15ns)", 15.0},
+		{"Warm(5ns)", 5.0},
+	}
 
 	rng := rand.New(rand.NewSource(42))
 
@@ -901,20 +910,40 @@ func main() {
 			})
 		}
 
-		// Print results table
+		// Print raw counters table
 		baseline := allMethodResults[0]
-		baselineCost := baseline.VecLoads*cacheMissNs + baseline.DistCalcs*distCalcNs
 
 		fmt.Println()
-		fmt.Printf("  %-26s %8s %10s %10s %10s %10s\n",
-			"Method", "Recall", "UnionRec", "DistCalcs", "VecLoads", "Proj.Speed")
-		fmt.Println("  " + repeatStr("-", 86))
+		fmt.Printf("  %-26s %8s %10s %10s %10s %8s %8s\n",
+			"Method", "Recall", "UnionRec", "DistCalcs", "VecLoads", "DC.Red", "VL.Red")
+		fmt.Println("  " + repeatStr("-", 90))
 
 		for _, r := range allMethodResults {
-			projCost := r.VecLoads*cacheMissNs + r.DistCalcs*distCalcNs
-			projSpeedup := baselineCost / projCost
-			fmt.Printf("  %-26s %8.4f %10.4f %10.0f %10.0f %9.1fx\n",
-				r.Name, r.AvgRecall, r.UnionRec, r.DistCalcs, r.VecLoads, projSpeedup)
+			dcRed := baseline.DistCalcs / r.DistCalcs
+			vlRed := baseline.VecLoads / r.VecLoads
+			fmt.Printf("  %-26s %8.4f %10.4f %10.0f %10.0f %7.1fx %7.1fx\n",
+				r.Name, r.AvgRecall, r.UnionRec, r.DistCalcs, r.VecLoads, dcRed, vlRed)
+		}
+
+		// Projected speedup under different cache assumptions
+		fmt.Println()
+		fmt.Printf("  Projected speedup (cache scenarios):\n")
+		fmt.Printf("  %-26s", "Method")
+		for _, cs := range costScenarios {
+			fmt.Printf(" %12s", cs.Name)
+		}
+		fmt.Println()
+		fmt.Print("  " + repeatStr("-", 26+13*len(costScenarios)))
+		fmt.Println()
+
+		for _, r := range allMethodResults {
+			fmt.Printf("  %-26s", r.Name)
+			for _, cs := range costScenarios {
+				baseCost := baseline.VecLoads*cs.VecLoadNs + baseline.DistCalcs*distCalcNs
+				methCost := r.VecLoads*cs.VecLoadNs + r.DistCalcs*distCalcNs
+				fmt.Printf(" %11.1fx", baseCost/methCost)
+			}
+			fmt.Println()
 		}
 	}
 
@@ -928,19 +957,21 @@ func main() {
 	fmt.Println("  NOT progressive (coarse → fine refinement of the same representation).")
 	fmt.Println()
 	fmt.Println("  Implications for optimization strategy:")
-	fmt.Println("    - Progressive retrieval (draft/verify) may miss candidates unique to")
-	fmt.Println("      non-draft embeddings → recall loss when embeddings are spread")
-	fmt.Println("    - Adaptive Batch (like MIND) correctly handles complementary embeddings:")
+	fmt.Println("    - Progressive retrieval (draft/verify) misses candidates unique to")
+	fmt.Println("      non-draft embeddings → recall drops to 0.33 (catastrophic)")
+	fmt.Println("    - Adaptive Batch correctly handles complementary embeddings:")
 	fmt.Println("      similar embeddings batched together, dissimilar ones run independently")
-	fmt.Println("    - Full Batch (unified queue) works when embeddings share some overlap")
+	fmt.Println("    - Full Batch can be SLOWER for spread embeddings (unified queue")
+	fmt.Println("      explores too wide, more distCalcs than independent)")
 	fmt.Println()
-	fmt.Println("  RECOMMENDATION:")
-	fmt.Println("    Concentrated aspects → Batch or Adaptive Batch (high overlap = high savings)")
-	fmt.Println("    Spread aspects → Adaptive Batch (auto-fallback to independent)")
-	fmt.Println("    Progressive is only optimal if embeddings are truly coarse→fine refinements")
+	fmt.Println("  RECOMMENDATION: Adaptive Batch")
+	fmt.Println("    - Never worse than independent (safe default)")
+	fmt.Println("    - Speedup depends on actual embedding similarity + cache behavior")
+	fmt.Println("    - VecLoad/DistCalc reduction ratios are the reliable metrics")
+	fmt.Println("    - Projected speedup given as a RANGE (cold→warm cache)")
 	fmt.Println()
-	fmt.Println("  Cost model: vecLoad=40ns (L3 miss), distCalc=2ns (arithmetic)")
-	fmt.Println("  'Proj.Speed' = projected real-world speedup using this cost model")
+	fmt.Println("  Cost model: distCalc=2ns (stable), vecLoad=5-40ns (cache-dependent)")
+	fmt.Println("  Real speedup depends on dataset size vs L3 cache capacity")
 }
 
 func repeatStr(s string, n int) string {
