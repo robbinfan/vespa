@@ -630,16 +630,17 @@ func main() {
 		INTER_GROUP_SIGMA = float32(0.15) // noise within each aspect group
 	)
 
-	const distCalcNs = 2.0
-
+	// In C++, get_vector() is an inline pointer dereference (~0ns).
+	// The memory access cost is part of the distance computation.
 	type CostScenario struct {
-		Name      string
-		VecLoadNs float64
+		Name       string
+		DistCalcNs float64 // includes memory access for vector data
+		VecLoadNs  float64 // ~0 in C++ (inline pointer dereference)
 	}
 	costScenarios := []CostScenario{
-		{"Cold(40ns)", 40.0},
-		{"Mixed(15ns)", 15.0},
-		{"Warm(5ns)", 5.0},
+		{"Cold(50ns)", 50.0, 0.0},  // L3 miss: ~48ns mem + ~2ns compute
+		{"Mixed(10ns)", 10.0, 0.0}, // Realistic cache hit mix
+		{"Warm(3ns)", 3.0, 0.0},    // L1/L2 hit: mostly compute
 	}
 
 	rng := rand.New(rand.NewSource(42))
@@ -939,8 +940,8 @@ func main() {
 		for _, r := range allMethodResults {
 			fmt.Printf("  %-26s", r.Name)
 			for _, cs := range costScenarios {
-				baseCost := baseline.VecLoads*cs.VecLoadNs + baseline.DistCalcs*distCalcNs
-				methCost := r.VecLoads*cs.VecLoadNs + r.DistCalcs*distCalcNs
+				baseCost := baseline.VecLoads*cs.VecLoadNs + baseline.DistCalcs*cs.DistCalcNs
+				methCost := r.VecLoads*cs.VecLoadNs + r.DistCalcs*cs.DistCalcNs
 				fmt.Printf(" %11.1fx", baseCost/methCost)
 			}
 			fmt.Println()
@@ -967,11 +968,12 @@ func main() {
 	fmt.Println("  RECOMMENDATION: Adaptive Batch")
 	fmt.Println("    - Never worse than independent (safe default)")
 	fmt.Println("    - Speedup depends on actual embedding similarity + cache behavior")
-	fmt.Println("    - VecLoad/DistCalc reduction ratios are the reliable metrics")
-	fmt.Println("    - Projected speedup given as a RANGE (cold→warm cache)")
+	fmt.Println("    - DistCalc reduction is the primary speedup metric")
 	fmt.Println()
-	fmt.Println("  Cost model: distCalc=2ns (stable), vecLoad=5-40ns (cache-dependent)")
-	fmt.Println("  Real speedup depends on dataset size vs L3 cache capacity")
+	fmt.Println("  Cost model (corrected — C++ vector load ≈ 0):")
+	fmt.Println("    get_vector() is inline pointer dereference, NOT a separate cost.")
+	fmt.Println("    Memory access cost is part of distance calc (3-50ns depending on cache).")
+	fmt.Println("    Speedup ≈ DistCalc reduction ratio.")
 }
 
 func repeatStr(s string, n int) string {

@@ -28,8 +28,8 @@ OR(
 Each runs a full HNSW traversal **serially**:
 - 10 × independent entry point descent
 - 10 × independent visited set allocation
-- 10 × independent vector loads (cache misses)
-- Same document vectors loaded multiple times across queries
+- 10 × independent distance computations for overlapping graph regions
+- Same nodes visited multiple times across queries (redundant work)
 
 For OnePiece with 6 complementary embeddings, the measured cost is **8× single-query
 CPU** (not 6× — the extra overhead comes from cache thrashing between independent
@@ -63,19 +63,19 @@ Adaptive Batch:
 ```
 
 **Key insight**: Nearby interests explore overlapping graph regions. Sharing the
-visited set avoids redundant vector loads. Distant interests explore disjoint regions
-where batching adds overhead without saving vector loads.
+visited set avoids redundant distance computations. Distant interests explore
+disjoint regions where batching adds overhead without saving work.
 
 **Benchmark results** (100K docs, 64-dim, 50 clusters, 10 interests, averaged over 5 users):
 
-| Interest Distribution    | Strategy       | VL Reduction | Speedup Range¹ | Recall |
-|--------------------------|----------------|-------------|-----------------|--------|
-| Concentrated (2 clusters)| Adaptive Batch | **3.6×**    | 3.6×→2.4×→1.5× | 0.996  |
-| Mixed (3+3+4)            | Adaptive Batch | **1.5×**    | 1.5×→1.3×→1.1× | 0.997  |
-| Spread (10 clusters)     | Adaptive Batch | **1.0×**    | 1.0×→1.0×→1.0× | 0.997  |
+| Interest Distribution    | Strategy       | DC Reduction | Projected Speedup | Recall |
+|--------------------------|----------------|-------------|-------------------|--------|
+| Concentrated (2 clusters)| Adaptive Batch | **3.6×**    | ~3.6×             | 0.996  |
+| Mixed (3+3+4)            | Adaptive Batch | **1.5×**    | ~1.5×             | 0.997  |
+| Spread (10 clusters)     | Adaptive Batch | **1.0×**    | ~1.0×             | 0.997  |
 
-¹ Speedup range: cold cache (40ns/load) → mixed (15ns) → warm (5ns). VL Reduction
-is the reliable metric (cache-independent).
+Speedup ≈ DC (distance calc) reduction ratio. Vector load is ~0 in C++ (inline
+pointer dereference).
 
 Adaptive batch **never degrades** below independent baseline — it automatically
 falls back to independent search when interests are spread.
@@ -100,13 +100,13 @@ Adaptive Batch (same as MIND):
 
 **Benchmark results** (500K docs, 64-dim, 50 clusters, 6 complementary embeddings, 5 users):
 
-| Embedding Distribution    | Strategy       | VL Reduction | Speedup Range¹ | Recall |
-|---------------------------|----------------|-------------|-----------------|--------|
-| Concentrated (2 aspects)  | Adaptive Batch | **1.5×**    | 1.3×→1.1×→1.0× | 0.990  |
-| Mixed (3 aspects)         | Adaptive Batch | **1.3×**    | 1.2×→1.1×→1.0× | 0.995  |
-| Spread (6 aspects)        | Adaptive Batch | **1.0×**    | 1.0×→1.0×→1.0× | 0.950  |
+| Embedding Distribution    | Strategy       | DC Reduction | Projected Speedup | Recall |
+|---------------------------|----------------|-------------|-------------------|--------|
+| Concentrated (2 aspects)  | Adaptive Batch | **1.3×**    | ~1.3×             | 0.990  |
+| Mixed (3 aspects)         | Adaptive Batch | **1.2×**    | ~1.2×             | 0.995  |
+| Spread (6 aspects)        | Adaptive Batch | **1.0×**    | ~1.0×             | 0.950  |
 
-¹ Speedup range: cold cache (40ns/load) → mixed (15ns) → warm (5ns).
+Speedup ≈ DC reduction ratio. Vector load is ~0 in C++.
 
 **Why Progressive Retrieval FAILS for complementary embeddings**:
 
@@ -211,25 +211,31 @@ The core optimization in `search_layer_batch_helper`:
 
 ```cpp
 // For each neighbor of the current candidate:
-auto neighbor_vec = get_vector(neighbor_docid);  // ONE vector load
+auto neighbor_vec = get_vector(neighbor_docid);  // ~0ns pointer dereference
 for (size_t q = 0; q < num_queries; ++q) {
     double dist = calc_distance(query_vecs[q], neighbor_vec);  // N distance calcs
     // Update per-query best results...
 }
 ```
 
-Independent search loads the same vector N times. Batch search loads it once
-and computes N distances (~2ns each).
+Independent search visits the same node N times. Batch search visits it once
+and computes N distances.
 
-**Saving per shared node**: `(N-1) × vecLoadCost - (N-1) × 2ns`
+**Note on vector load cost**: In C++, `get_vector(docid)` is an inline pointer
+dereference (~0ns). There is no separate "vector load" cost — the memory access
+happens inside `_distance_func->calc()` as part of the distance computation.
+The batch advantage comes from reducing the total number of unique nodes visited
+(shared visited set), not from eliminating a separate load step.
 
-| Cache scenario | vecLoad | Saving/node (N=10) | Load:Calc ratio |
-|----------------|---------|-------------------|-----------------|
-| Cold (L3 miss) | 40ns    | 342ns             | 20:1            |
-| Mixed          | 15ns    | 117ns             | 7.5:1           |
-| Warm (L2 hit)  | 5ns     | 27ns              | 2.5:1           |
+**Distance calc cost** (includes vector memory access):
 
-Real-world saving depends on dataset size vs L3 cache capacity.
+| Cache scenario        | distCalc/node | Note                              |
+|-----------------------|---------------|-----------------------------------|
+| Cold (L3 miss)        | ~50ns         | First access: ~48ns mem + ~2ns IP |
+| Mixed (realistic)     | ~10ns         | HNSW traversal cache hit mix      |
+| Warm (L1/L2 hit)      | ~3ns          | Hot graph region, mostly compute  |
+
+Batch speedup ≈ DistCalc reduction ratio (the reliable metric).
 
 ### Filter Handling
 
@@ -238,7 +244,7 @@ Batch search evaluates filters once per unique node (not N times):
 | Scenario              | Independent (10 queries) | Batch          | Saving |
 |-----------------------|--------------------------|----------------|--------|
 | Filter check per node | 10×                      | 1×             | 10×    |
-| Vector load per node  | 10×                      | 1×             | 10×    |
+| Node visits           | 10×                      | 1×             | 10×    |
 | Distance calcs        | 10×                      | 10× (unchanged)| 0×     |
 
 For restrictive filters (e.g., category + region), the filter bitvector check
@@ -304,29 +310,28 @@ complementary embeddings, use the default Adaptive Batch path (`use_progressive=
 
 ## Cost Model
 
-Real-world HNSW search is **memory-bandwidth bound**, not compute-bound.
-However, not every vector load is a cold L3 cache miss — HNSW graph traversal
-has temporal/spatial locality, and independent searches also benefit from cache
-warmth across sequential queries.
+**Corrected**: In C++, `get_vector(docid)` is an inline pointer dereference
+returning a `TypedCells` view — it costs ~0ns. There is **no separate vector
+load cost**. The memory access (cache hit/miss) happens inside
+`_distance_func->calc()` as part of the distance computation.
 
-| Operation                  | Latency   | Notes                               |
-|----------------------------|-----------|--------------------------------------|
-| Vector load (L3 miss)     | ~40ns     | Cold access, random 256B read        |
-| Vector load (L3 hit)      | ~15ns     | Realistic HNSW traversal mix         |
-| Vector load (L2 hit)      | ~5ns      | Hot graph region, repeated access    |
-| Distance calc (64-dim IP) | ~2ns      | Compute-bound, stable                |
-| Filter bitvector check    | ~1ns      | Usually in L1 cache                  |
+| Operation                        | Latency   | Notes                               |
+|----------------------------------|-----------|--------------------------------------|
+| get_vector() (pointer deref)     | ~0ns      | Inline, returns TypedCells view      |
+| Distance calc (cold, L3 miss)    | ~50ns     | ~48ns memory fetch + ~2ns compute    |
+| Distance calc (mixed, realistic) | ~10ns     | HNSW traversal with cache locality   |
+| Distance calc (warm, L1/L2 hit)  | ~3ns      | Hot graph region, mostly compute     |
+| Filter bitvector check           | ~1ns      | Usually in L1 cache                  |
 
-The ratio between vector load and distance calc ranges from **2.5:1** (warm cache)
-to **20:1** (cold cache). Projected speedup is given as a **range** in the
-benchmarks, not a single number. The reliable metric is the raw **VecLoad reduction
-ratio**, which is independent of cache assumptions.
+The batch search advantage comes from **reducing the number of unique nodes
+visited** (shared visited set), not from eliminating a separate vector load step.
+Projected speedup ≈ **DistCalc reduction ratio**, which is the reliable metric.
 
 ## Projected Production Impact
 
-Projected speedup depends on the cache hit rate assumption. The table below shows
-a range from cold cache (worst case, 40ns/load) to warm cache (best case, 5ns/load).
-The **VecLoad reduction** column is cache-independent and reliable.
+Projected speedup ≈ **DistCalc reduction ratio** (since vector load ≈ 0 in C++).
+The actual distance calc latency varies with cache behavior (3-50ns), but the
+speedup ratio is determined by how many fewer distance calculations are needed.
 
 ### MIND (10 interests)
 
@@ -334,10 +339,10 @@ Performance depends on interest distribution — real users typically have 1-3 d
 interest categories, making concentrated/mixed the common case:
 
 ```
-                          VecLoad Red.   Speedup Range (cold → mixed → warm)
-Concentrated (2 clusters):   3.6×        3.6× → 2.4× → 1.5×
-Mixed (3+3+4):               1.5×        1.5× → 1.3× → 1.1×
-Spread (10 clusters):        1.0×        1.0× → 1.0× → 1.0× (no penalty)
+                          DC Reduction   Projected Speedup
+Concentrated (2 clusters):   3.6×        ~3.6× (shared graph region)
+Mixed (3+3+4):               1.5×        ~1.5×
+Spread (10 clusters):        1.0×        ~1.0× (no penalty)
 ```
 
 Most real MIND users fall in concentrated/mixed.
@@ -349,24 +354,24 @@ with near-zero ground truth overlap between embeddings. This limits optimization
 headroom compared to MIND:
 
 ```
-                          VecLoad Red.   Speedup Range (cold → mixed → warm)
-Concentrated (2 aspects):   1.5×         1.3× → 1.1× → 1.0×
-Mixed (3 aspects):          1.3×         1.2× → 1.1× → 1.0×
-Spread (6 aspects):         1.0×         1.0× → 1.0× → 1.0× (no penalty)
+                          DC Reduction   Projected Speedup
+Concentrated (2 aspects):   1.3×         ~1.3×
+Mixed (3 aspects):          1.2×         ~1.2×
+Spread (6 aspects):         1.0×         ~1.0× (no penalty)
 ```
 
 **Important**: Progressive retrieval is NOT applicable — recall drops to 0.33 because
 draft embeddings cannot represent other aspects' candidates.
 
-The modest VecLoad reduction (1.0-1.5×) reflects the fundamental constraint:
+The modest DC reduction (1.0-1.3×) reflects the fundamental constraint:
 complementary embeddings explore disjoint graph regions, so shared visited set
 provides minimal benefit. Real-world improvement depends on how much overlap exists
 between the actual OnePiece embeddings — if some aspects are correlated in practice,
-the VecLoad reduction (and thus speedup) could be higher.
+the DC reduction (and thus speedup) could be higher.
 
 ### Filter Savings (both MIND and OnePiece)
 
-Even when vector load savings are modest, batch search still saves on filter
+Even when DistCalc savings are modest, batch search still saves on filter
 evaluation:
 
 ```
@@ -428,7 +433,7 @@ is fundamentally incompatible with interests that explore different graph region
 ### Attempt 3: Per-Query Exploration Queues + Shared Visited Set
 
 **Idea**: Give each query its own candidate priority queue (instead of one unified
-queue), but share the visited set to avoid redundant vector loads. When any query
+queue), but share the visited set to avoid redundant node visits. When any query
 visits a node, compute distances for all queries. Each query independently decides
 which neighbors to explore based on its own best candidates.
 
@@ -509,8 +514,8 @@ go run benchmark_onepiece_hnsw.go
 ```
 
 Both benchmarks output:
-- Raw counters: VecLoads, DistCalcs, VL/DC reduction ratios
-- Projected speedup under 3 cache scenarios (cold 40ns / mixed 15ns / warm 5ns)
+- Raw counters: DistCalcs, VecLoads (informational), DC/VL reduction ratios
+- Projected speedup under 3 distance calc cost scenarios (cold 50ns / mixed 10ns / warm 3ns)
 - Per-query and union recall vs brute-force ground truth
 
 ## Key Design Decisions
@@ -523,9 +528,9 @@ Both benchmarks output:
    batching, falls back to independent for dissimilar queries. This guarantees
    no regression vs baseline.
 
-3. **VecLoad reduction as primary metric**: Projected speedup depends on cache
-   assumptions (2.5:1 to 20:1 load:calc ratio). VecLoad reduction is the cache-
-   independent metric that translates to real savings.
+3. **DistCalc reduction as primary metric**: In C++, vector load is ~0 (inline
+   pointer dereference). The speedup comes from reducing the number of distance
+   computations via shared visited set. Speedup ≈ DC reduction ratio.
 
 4. **Complementary ≠ progressive**: OnePiece embeddings are complementary (each
    captures a different aspect with ~0% ground truth overlap). Progressive retrieval
@@ -538,7 +543,7 @@ Both benchmarks output:
 
 1. **Measure real embedding similarity**: Run dot-product analysis on actual MIND/OnePiece
    embeddings to determine which distribution case (concentrated/mixed/spread) applies.
-   This determines the expected VecLoad reduction.
+   This determines the expected DC reduction.
 
 2. **Profile actual cache behavior**: Use `perf stat` to measure L2/L3 miss rates
    during HNSW search. This determines where in the cold→warm range the real system

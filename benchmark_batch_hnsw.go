@@ -888,19 +888,19 @@ func main() {
 
 	// === Run benchmarks: 5 random users per distribution for statistics ===
 	const NUM_USERS = 5
-	const distCalcNs = 2.0 // 64-dim inner product distance calc time (compute-bound, stable)
-
-	// Cost scenarios: not every vecLoad is a cold L3 miss.
-	// HNSW graph traversal has temporal/spatial locality; independent searches
-	// also benefit from cache warmth across sequential queries.
+	// In C++, get_vector() is an inline pointer dereference (~0ns).
+	// The actual memory access cost is part of the distance computation.
+	// Distance calc includes vector data access (cache hit/miss).
 	type CostScenario struct {
-		Name      string
-		VecLoadNs float64
+		Name       string
+		DistCalcNs float64 // includes memory access for vector data
+		VecLoadNs  float64 // ~0 in C++ (inline pointer dereference)
 	}
 	costScenarios := []CostScenario{
-		{"Cold (40ns)", 40.0},   // All L3 misses (worst case, first access)
-		{"Mixed (15ns)", 15.0},  // Realistic mix of L2/L3 hits and misses
-		{"Warm (5ns)", 5.0},     // Mostly cache hits (repeated access patterns)
+		// distCalc varies by cache behavior: cold=memory fetch+compute, warm=L1 hit+compute
+		{"Cold (50ns dc)", 50.0, 0.0},  // L3 miss: ~48ns mem + ~2ns compute
+		{"Mixed (10ns dc)", 10.0, 0.0}, // Realistic mix of cache hits/misses
+		{"Warm (3ns dc)", 3.0, 0.0},    // L1/L2 hit: mostly compute
 	}
 
 	type MethodDef struct {
@@ -1029,8 +1029,8 @@ func main() {
 		for _, r := range avgResults {
 			fmt.Printf("  %-30s", r.Name)
 			for _, cs := range costScenarios {
-				baseCost := baseline.VecLoads*cs.VecLoadNs + baseline.DistCalcs*distCalcNs
-				methCost := r.VecLoads*cs.VecLoadNs + r.DistCalcs*distCalcNs
+				baseCost := baseline.VecLoads*cs.VecLoadNs + baseline.DistCalcs*cs.DistCalcNs
+				methCost := r.VecLoads*cs.VecLoadNs + r.DistCalcs*cs.DistCalcNs
 				fmt.Printf(" %11.1fx", baseCost/methCost)
 			}
 			fmt.Println()
@@ -1043,22 +1043,23 @@ func main() {
 	fmt.Println("COST MODEL & CONCLUSIONS")
 	fmt.Println("================================================================================")
 	fmt.Println()
-	fmt.Println("  Cost model assumptions:")
-	fmt.Println("    Distance calc (64-dim IP):  ~2ns   (compute-bound, stable)")
-	fmt.Println("    Vector load cost depends on cache hit rate:")
-	fmt.Println("      Cold (L3 miss):           ~40ns  (first access, random 256B read)")
-	fmt.Println("      Mixed (L2/L3 hit mix):    ~15ns  (realistic HNSW traversal)")
-	fmt.Println("      Warm (mostly L2 hits):    ~5ns   (hot graph region)")
+	fmt.Println("  Cost model (corrected — C++ vector load ≈ 0):")
+	fmt.Println("    In C++, get_vector(docid) is an inline pointer dereference (~0ns).")
+	fmt.Println("    The memory access cost (cache hit/miss) is part of distance calc.")
+	fmt.Println("    VecLoad as a separate cost does NOT exist in C++.")
 	fmt.Println()
-	fmt.Println("  The projected speedup RANGE (cold→warm) reflects uncertainty in")
-	fmt.Println("  actual cache behavior. Real production speedup depends on:")
-	fmt.Println("    - Dataset size vs cache capacity (L3 size)")
-	fmt.Println("    - Graph connectivity and traversal locality")
-	fmt.Println("    - Concurrent query load (cache contention)")
+	fmt.Println("    Distance calc (64-dim IP) includes vector memory access:")
+	fmt.Println("      Cold (L3 miss + compute): ~50ns  (first access to vector data)")
+	fmt.Println("      Mixed (cache hit mix):    ~10ns  (realistic HNSW traversal)")
+	fmt.Println("      Warm (L1/L2 hit):         ~3ns   (hot graph region)")
+	fmt.Println()
+	fmt.Println("  Projected speedup ≈ DistCalc reduction ratio (the reliable metric).")
+	fmt.Println("  Batch search saves by: fewer unique nodes visited (shared visited set),")
+	fmt.Println("  NOT by eliminating a separate 'vector load' step.")
 	fmt.Println()
 	fmt.Println("  RECOMMENDATION: Use Adaptive Batch (auto-cluster nearby interests)")
 	fmt.Println("    - Never worse than independent baseline (safe default)")
-	fmt.Println("    - VecLoad reduction is the reliable metric (independent of cost model)")
+	fmt.Println("    - DistCalc reduction is the primary speedup metric")
 	fmt.Println("    - Zero accuracy loss in all tested configurations")
 	fmt.Println()
 	fmt.Println("  WHY SPECULATIVE DOESN'T HELP (at 100K scale):")
