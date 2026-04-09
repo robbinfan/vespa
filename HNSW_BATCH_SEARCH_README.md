@@ -206,14 +206,19 @@ loads is the primary optimization lever. Batch search targets exactly this.
 
 ## Projected Production Impact
 
-### MIND (10 interests, mixed distribution)
+### MIND (10 interests)
+
+Performance depends on interest distribution — real users typically have 1-3 dominant
+interest categories, making concentrated/mixed the common case:
 
 ```
-Current:     10 × independent HNSW = ~10× single-query CPU
-Batch:       1× shared traversal, 10× distance calcs = ~6× CPU
-Adaptive:    clusters of 3+3+4, batch within = ~5× CPU
-Improvement: ~2× speedup
+                         Independent    Adaptive Batch    Speedup
+Concentrated (2 clusters):  10× CPU       ~2.8× CPU       3.6×
+Mixed (3+3+4):              10× CPU       ~6.7× CPU       1.5×
+Spread (10 clusters):       10× CPU       10× CPU         1.0× (no penalty)
 ```
+
+Most real MIND users fall in concentrated/mixed → **expected 1.5×-3.6× speedup**.
 
 ### OnePiece (6 progressive steps)
 
