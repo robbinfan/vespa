@@ -502,124 +502,144 @@ func (h *HnswIndex) SearchBatch(queries [][]float32, k, ef int) [][]Neighbor {
 	return results
 }
 
-// SearchSpeculative: Draft/Verify two-phase search (inspired by speculative decoding)
-// Draft: N independent coarse searches (cheap, explore diverse regions)
-// Verify: batch search starting from combined seed points
+// SearchSpeculative: Draft/Verify search (speculative decoding inspired)
+// V1: seed with top-1 from draft + greedy descent + beam search
+// V2: warm-start sequential (each query seeded by most similar prev query)
 func (h *HnswIndex) SearchSpeculative(queries [][]float32, k, ef int, draftEfRatio float64) [][]Neighbor {
 	n := len(queries)
-	draftEf := int(float64(ef) * draftEfRatio)
-	if draftEf < 10 {
-		draftEf = 10
-	}
-
-	// === DRAFT PHASE: N independent coarse searches with small ef ===
-	draftResults := make([][]Neighbor, n)
-	for qi, q := range queries {
-		draftResults[qi] = h.SearchSingle(q, draftEf, draftEf)
-	}
-
-	seeds := map[int]bool{}
-	for _, res := range draftResults {
-		for _, nb := range res {
-			seeds[nb.Docid] = true
-		}
-	}
-
-	// === VERIFY PHASE: from seed points, do full-ef batch search ===
 	h.counting = true
 	defer func() { h.counting = false }()
 
-	allBest := make([][]PQItem, n)
-	for qi := 0; qi < n; qi++ {
-		allBest[qi] = make([]PQItem, 0, len(seeds))
-		for docid := range seeds {
-			d := h.distToDoc(queries[qi], docid)
-			allBest[qi] = append(allBest[qi], PQItem{d, docid})
-		}
-		sort.Slice(allBest[qi], func(i, j int) bool {
-			return allBest[qi][i].dist < allBest[qi][j].dist
-		})
-		if len(allBest[qi]) > ef {
-			allBest[qi] = allBest[qi][:ef]
-		}
+	// === DRAFT: run full search with first query ===
+	draftResults := h.searchSingleCore(queries[0], ef, ef)
+	results := make([][]Neighbor, n)
+
+	// First query: use draft directly
+	best0 := draftResults.best
+	if len(best0) > k {
+		best0 = best0[:k]
+	}
+	results[0] = make([]Neighbor, len(best0))
+	for i, b := range best0 {
+		results[0][i] = Neighbor{b.docid, b.dist}
 	}
 
-	visited := make(map[int]bool, ef*n)
-	for docid := range seeds {
-		visited[docid] = true
+	// === VERIFY + REFINE: each remaining query ===
+	// Verify against draft's top-K results (small K), pick best as seed
+	// Then greedy descent from seed + standard beam search
+	seedK := 20 // only check top-20 draft results, not all ef
+	if seedK > len(draftResults.best) {
+		seedK = len(draftResults.best)
 	}
+	for qi := 1; qi < n; qi++ {
+		q := queries[qi]
 
-	limitDists := make([]float64, n)
-	for qi := 0; qi < n; qi++ {
-		if len(allBest[qi]) >= ef {
-			limitDists[qi] = allBest[qi][ef-1].dist
-		} else {
-			limitDists[qi] = math.Inf(1)
-		}
-	}
-
-	cands := &MinPQ{}
-	heap.Init(cands)
-	for docid := range seeds {
-		minD := math.Inf(1)
-		for qi := 0; qi < n; qi++ {
-			d := ipDist(queries[qi], h.Vecs[docid])
-			if d < minD {
-				minD = d
+		// Find best seed from draft results (cheap: only seedK distance calcs)
+		bestSeed := -1
+		bestSeedDist := math.Inf(1)
+		for si := 0; si < seedK; si++ {
+			d := h.distToDoc(q, draftResults.best[si].docid)
+			if d < bestSeedDist {
+				bestSeedDist = d
+				bestSeed = draftResults.best[si].docid
 			}
 		}
-		heap.Push(cands, PQItem{minD, docid})
-	}
 
-	for cands.Len() > 0 {
-		item := heap.Pop(cands).(PQItem)
-		allLimitsMet := true
-		for qi := 0; qi < n; qi++ {
-			if item.dist <= limitDists[qi] {
-				allLimitsMet = false
-				break
-			}
-		}
-		if allLimitsMet && limitDists[0] < math.Inf(1) {
-			break
-		}
-		h.Stats.NodesVisited++
-
-		for _, nb := range h.Links[item.docid] {
-			if !visited[nb] {
-				visited[nb] = true
-				dists := h.distToDocBatch(queries, nb)
-				minD := math.Inf(1)
-				anyUseful := false
-				for qi := 0; qi < n; qi++ {
-					d := dists[qi]
-					if d < minD {
-						minD = d
-					}
-					if len(allBest[qi]) < ef || d < limitDists[qi] {
-						anyUseful = true
-						allBest[qi] = append(allBest[qi], PQItem{d, nb})
-						sort.Slice(allBest[qi], func(i, j int) bool {
-							return allBest[qi][i].dist < allBest[qi][j].dist
-						})
-						if len(allBest[qi]) > ef {
-							allBest[qi] = allBest[qi][:ef]
-						}
-						if len(allBest[qi]) >= ef {
-							limitDists[qi] = allBest[qi][ef-1].dist
-						}
-					}
-				}
-				if anyUseful {
-					heap.Push(cands, PQItem{minD, nb})
+		// Greedy descent from seed (query-specific fine-tuning)
+		ep := bestSeed
+		epDist := bestSeedDist
+		changed := true
+		for changed {
+			changed = false
+			for _, nb := range h.Links[ep] {
+				d := h.distToDoc(q, nb)
+				if d < epDist {
+					ep = nb
+					epDist = d
+					changed = true
 				}
 			}
 		}
+
+		// Standard beam search from query-specific entry point
+		results[qi] = h.beamSearch(q, ep, epDist, k, ef)
 	}
+	return results
+}
+
+// SearchWarmChain: sequential warm-start — each query seeded by most similar prev query's result
+func (h *HnswIndex) SearchWarmChain(queries [][]float32, k, ef int) [][]Neighbor {
+	n := len(queries)
+	h.counting = true
+	defer func() { h.counting = false }()
 
 	results := make([][]Neighbor, n)
-	for qi := 0; qi < n; qi++ {
-		best := allBest[qi]
+	resultNodes := make([][]PQItem, n) // keep PQItem results for seeding
+
+	// First query: standard full search
+	sr := h.searchSingleCore(queries[0], ef, ef)
+	resultNodes[0] = sr.best
+	best0 := sr.best
+	if len(best0) > k {
+		best0 = best0[:k]
+	}
+	results[0] = make([]Neighbor, len(best0))
+	for i, b := range best0 {
+		results[0][i] = Neighbor{b.docid, b.dist}
+	}
+
+	for qi := 1; qi < n; qi++ {
+		q := queries[qi]
+
+		// Find most similar previous query
+		bestPrev := 0
+		bestSim := -math.MaxFloat64
+		for pq := 0; pq < qi; pq++ {
+			dot := 0.0
+			for d := range q {
+				dot += float64(q[d]) * float64(queries[pq][d])
+			}
+			if dot > bestSim {
+				bestSim = dot
+				bestPrev = pq
+			}
+		}
+
+		// Seed from previous query's best result
+		seedK := 10
+		if seedK > len(resultNodes[bestPrev]) {
+			seedK = len(resultNodes[bestPrev])
+		}
+		bestSeed := -1
+		bestSeedDist := math.Inf(1)
+		for si := 0; si < seedK; si++ {
+			d := h.distToDoc(q, resultNodes[bestPrev][si].docid)
+			if d < bestSeedDist {
+				bestSeedDist = d
+				bestSeed = resultNodes[bestPrev][si].docid
+			}
+		}
+
+		// Greedy descent from seed
+		ep := bestSeed
+		epDist := bestSeedDist
+		changed := true
+		for changed {
+			changed = false
+			for _, nb := range h.Links[ep] {
+				d := h.distToDoc(q, nb)
+				if d < epDist {
+					ep = nb
+					epDist = d
+					changed = true
+				}
+			}
+		}
+
+		// Standard beam search
+		sr := h.searchSingleCoreFromEntry(q, ep, epDist, ef, ef)
+		resultNodes[qi] = sr.best
+		best := sr.best
 		if len(best) > k {
 			best = best[:k]
 		}
@@ -629,6 +649,133 @@ func (h *HnswIndex) SearchSpeculative(queries [][]float32, k, ef int, draftEfRat
 		}
 	}
 	return results
+}
+
+// beamSearch: standard beam search from a given entry point
+func (h *HnswIndex) beamSearch(query []float32, ep int, epDist float64, k, ef int) []Neighbor {
+	pq := &MinPQ{{epDist, ep}}
+	heap.Init(pq)
+	visited := map[int]bool{ep: true}
+	best := []PQItem{{epDist, ep}}
+
+	for pq.Len() > 0 {
+		item := heap.Pop(pq).(PQItem)
+		if len(best) >= ef && item.dist > best[ef-1].dist {
+			break
+		}
+		h.Stats.NodesVisited++
+		for _, nb := range h.Links[item.docid] {
+			if !visited[nb] {
+				visited[nb] = true
+				d := h.distToDoc(query, nb)
+				if len(best) < ef || d < best[len(best)-1].dist {
+					heap.Push(pq, PQItem{d, nb})
+					best = append(best, PQItem{d, nb})
+					sort.Slice(best, func(i, j int) bool { return best[i].dist < best[j].dist })
+					if len(best) > ef {
+						best = best[:ef]
+					}
+				}
+			}
+		}
+	}
+
+	if len(best) > k {
+		best = best[:k]
+	}
+	result := make([]Neighbor, len(best))
+	for i, b := range best {
+		result[i] = Neighbor{b.docid, b.dist}
+	}
+	return result
+}
+
+// searchSingleCore: internal search returning raw results (no counting toggle)
+// Returns both the best list and visited set for reuse as seeds
+type searchResult struct {
+	best    []PQItem
+	visited map[int]bool
+}
+
+func (h *HnswIndex) searchSingleCore(query []float32, k, ef int) searchResult {
+	ep := h.Entry
+	epDist := h.distToDoc(query, ep)
+
+	// Greedy descent
+	changed := true
+	for changed {
+		changed = false
+		for _, nb := range h.Links[ep] {
+			d := h.distToDoc(query, nb)
+			if d < epDist {
+				ep = nb
+				epDist = d
+				changed = true
+			}
+		}
+	}
+
+	// Beam search
+	pq := &MinPQ{{epDist, ep}}
+	heap.Init(pq)
+	visited := map[int]bool{ep: true}
+	best := []PQItem{{epDist, ep}}
+
+	for pq.Len() > 0 {
+		item := heap.Pop(pq).(PQItem)
+		if len(best) >= ef && item.dist > best[ef-1].dist {
+			break
+		}
+		h.Stats.NodesVisited++
+		for _, nb := range h.Links[item.docid] {
+			if !visited[nb] {
+				visited[nb] = true
+				d := h.distToDoc(query, nb)
+				if len(best) < ef || d < best[len(best)-1].dist {
+					heap.Push(pq, PQItem{d, nb})
+					best = append(best, PQItem{d, nb})
+					sort.Slice(best, func(i, j int) bool { return best[i].dist < best[j].dist })
+					if len(best) > ef {
+						best = best[:ef]
+					}
+				}
+			}
+		}
+	}
+
+	return searchResult{best: best, visited: visited}
+}
+
+// searchSingleCoreFromEntry: beam search from a given entry point (no greedy descent from global entry)
+func (h *HnswIndex) searchSingleCoreFromEntry(query []float32, ep int, epDist float64, k, ef int) searchResult {
+	pq := &MinPQ{{epDist, ep}}
+	heap.Init(pq)
+	visited := map[int]bool{ep: true}
+	best := []PQItem{{epDist, ep}}
+
+	for pq.Len() > 0 {
+		item := heap.Pop(pq).(PQItem)
+		if len(best) >= ef && item.dist > best[ef-1].dist {
+			break
+		}
+		h.Stats.NodesVisited++
+		for _, nb := range h.Links[item.docid] {
+			if !visited[nb] {
+				visited[nb] = true
+				d := h.distToDoc(query, nb)
+				if len(best) < ef || d < best[len(best)-1].dist {
+					heap.Push(pq, PQItem{d, nb})
+					best = append(best, PQItem{d, nb})
+					sort.Slice(best, func(i, j int) bool { return best[i].dist < best[j].dist })
+					if len(best) > ef {
+						best = best[:ef]
+					}
+				}
+			}
+		}
+	}
+
+	return searchResult{best: best, visited: visited}
 }
 
 // SearchAdaptiveBatch groups nearby queries and batches within each group.
@@ -791,6 +938,8 @@ func runBenchmark(hnsw *HnswIndex, queries [][]float32, groundTruths [][]Neighbo
 			results = hnsw.SearchSpeculative(queries, k, ef, draftRatio)
 		case "adaptive_batch":
 			results = hnsw.SearchAdaptiveBatch(queries, k, ef)
+		case "warm_chain":
+			results = hnsw.SearchWarmChain(queries, k, ef)
 		}
 
 		elapsed := time.Since(t)
@@ -910,9 +1059,8 @@ func main() {
 	}
 	methods := []MethodDef{
 		{"Independent (baseline)", "independent", 0},
-		{"Batch (shared visited)", "batch", 0},
-		{"Adaptive Batch", "adaptive_batch", 0},
-		{"Speculative (draft=10%)", "speculative", 0.1},
+		{"Speculative (seed=top20)", "speculative", 0.1},
+		{"Warm Chain (sequential)", "warm_chain", 0},
 	}
 
 	for _, distType := range querysets {
