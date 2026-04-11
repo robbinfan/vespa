@@ -111,6 +111,28 @@ private:
     void initSortData(const search::RankedHit *a, uint32_t n);
     uint8_t * realloc(uint32_t n, size_t & variableWidth, uint32_t & available, uint32_t & dataSize, uint8_t *mySortData);
 
+    /**
+     * True if the first sort field is a cheap fixed-width attribute with no
+     * blob converter. This is the gate for the lazy top-K path: only such
+     * fields let us cheaply encode only the leading key for all hits and
+     * defer the expensive tail-field encoding to the small candidate set.
+     */
+    bool lazyFirstFieldIsCheap() const;
+
+    /**
+     * Try the lazy top-K sort path. When applicable, this encodes only the
+     * first sort field for all n hits, uses nth_element to find the pivot,
+     * selects a candidate set C (|C| bounded by 4*topn), fully encodes
+     * fields for C, sorts C, truncates _sortDataArray to topn winners, and
+     * writes them back to a[0..topn).
+     *
+     * Returns true if the lazy path ran to completion and the caller should
+     * consider the sort finished. Returns false otherwise (caller must fall
+     * back to the legacy full-encode + radix/std::sort path). On a false
+     * return, a[] is untouched.
+     */
+    bool tryLazyTopK(search::RankedHit *a, uint32_t n, uint32_t topn);
+
 public:
     FastS_SortSpec(const FastS_SortSpec &) = delete;
     FastS_SortSpec & operator = (const FastS_SortSpec &) = delete;
