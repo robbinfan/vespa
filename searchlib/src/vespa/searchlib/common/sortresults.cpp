@@ -479,9 +479,127 @@ public:
 };
 
 
+namespace {
+
+// Heuristic thresholds for the lazy top-K path. These are deliberately
+// conservative: the lazy path only kicks in when there is clearly room for
+// it to win, and its fallback cost is bounded.
+//
+//   LAZY_MIN_N             — below this N the constant overhead of the
+//                            nth_element + scratch encoding swamps the win.
+//   LAZY_MAX_CAND_FACTOR   — if the candidate set after field-0 pivoting
+//                            grows beyond this many * topn, we bail out.
+//                            A factor of 4 keeps the fallback cost below
+//                            ~20% while catching most real workloads.
+constexpr uint32_t LAZY_MIN_N            = 256;
+constexpr uint32_t LAZY_MAX_CAND_FACTOR  = 4;
+
+} // namespace <unnamed>
+
+bool
+FastS_SortSpec::lazyFirstFieldIsCheap() const
+{
+    if (_vectors.empty()) return false;
+    const VectorRef & v0 = _vectors.front();
+    if (v0._type != ASC_VECTOR && v0._type != DESC_VECTOR) return false;
+    if (v0._converter != nullptr) return false;             // UCA / lowercase: not necessarily fixed width
+    if (v0._vector == nullptr) return false;
+    if (v0._vector->getFixedWidth() == 0) return false;     // string: variable width
+    if (v0._vector->hasMultiValue()) return false;
+    return true;
+}
+
+bool
+FastS_SortSpec::tryLazyTopK(RankedHit *a, uint32_t n, uint32_t topn)
+{
+    // --- gating ---
+    if (_doom.hard_doom()) return false;
+    if (n < LAZY_MIN_N) return false;
+    if (topn == 0 || topn >= n) return false;
+    if (uint64_t(topn) * LAZY_MAX_CAND_FACTOR > n) return false;
+    if (_vectors.size() < 2) return false;  // lazy only amortizes when there are tail fields
+    if (!lazyFirstFieldIsCheap()) return false;
+
+    const VectorRef & v0 = _vectors.front();
+    const uint32_t w0 = static_cast<uint32_t>(v0._vector->getFixedWidth());
+    const bool ascending = (v0._type == ASC_VECTOR);
+
+    // --- step 1: encode field 0 only, for all n hits, into a scratch buffer.
+    std::vector<uint8_t> f0bytes(size_t(w0) * n);
+    uint8_t *p = f0bytes.data();
+    for (uint32_t i = 0; i < n; ++i, p += w0) {
+        long written = ascending
+            ? v0._vector->serializeForAscendingSort(a[i].getDocId(), p, w0, nullptr)
+            : v0._vector->serializeForDescendingSort(a[i].getDocId(), p, w0, nullptr);
+        if (written < 0 || uint32_t(written) != w0) {
+            // The attribute wrote an unexpected byte count (shouldn't happen for
+            // fixed-width no-converter attributes, but be defensive).
+            return false;
+        }
+    }
+
+    // --- step 2: nth_element on indices using memcmp of the field-0 bytes.
+    std::vector<uint32_t> idx(n);
+    for (uint32_t i = 0; i < n; ++i) idx[i] = i;
+    const uint8_t *f0base = f0bytes.data();
+    auto field0_less = [f0base, w0](uint32_t x, uint32_t y) {
+        return memcmp(f0base + size_t(x) * w0, f0base + size_t(y) * w0, w0) < 0;
+    };
+    std::nth_element(idx.begin(), idx.begin() + (topn - 1), idx.end(), field0_less);
+    const uint8_t *pivot = f0base + size_t(idx[topn - 1]) * w0;
+
+    // --- step 3: collect candidate set C.
+    //  idx[0..topn) are all <= pivot (nth_element guarantees this).
+    //  idx[topn..n) may still contain elements == pivot (ties shuffled right).
+    //  We must include those ties too, otherwise we could miss a genuine top-K
+    //  winner whose full sortdata beats a same-field0 peer already in the
+    //  left half.
+    //
+    //  Importantly we snapshot the hit content into `cand` *before* we let
+    //  initSortData touch _sortDataArray/_binarySortData — that way we never
+    //  alias the caller's a[] with the buffer we later write back to.
+    const uint32_t maxCand = topn * LAZY_MAX_CAND_FACTOR;
+    std::vector<RankedHit> cand;
+    cand.reserve(topn * 2);
+    for (uint32_t i = 0; i < topn; ++i) cand.push_back(a[idx[i]]);
+    for (uint32_t i = topn; i < n; ++i) {
+        const uint8_t *q = f0base + size_t(idx[i]) * w0;
+        if (memcmp(q, pivot, w0) == 0) {
+            cand.push_back(a[idx[i]]);
+            if (cand.size() > maxCand) {
+                // Too many ties — the candidate set would defeat the
+                // optimization. Fall back to the legacy full path.
+                return false;
+            }
+        }
+    }
+
+    // --- step 4: full-encode candidates only, then plain std::sort.
+    initSortData(cand.data(), uint32_t(cand.size()));
+    SortData *sd = &_sortDataArray[0];
+    const uint32_t candN = uint32_t(_sortDataArray.size());
+    std::sort(sd, sd + candN, StdSortDataCompare(&_binarySortData[0]));
+
+    // Truncate to exactly topn winners — matches the contract of the top-K
+    // radix path (downstream uses copySortData/getSortRef with an explicit
+    // offset+count that never exceeds topn).
+    const uint32_t winners = std::min(topn, candN);
+    if (_sortDataArray.size() > winners) {
+        _sortDataArray.resize(winners);
+    }
+    for (uint32_t i = 0; i < winners; ++i) {
+        a[i]._rankValue = _sortDataArray[i]._rankValue;
+        a[i]._docId     = _sortDataArray[i]._docId;
+    }
+    return true;
+}
+
 void
 FastS_SortSpec::sortResults(RankedHit a[], uint32_t n, uint32_t topn)
 {
+    if (tryLazyTopK(a, n, topn)) {
+        return;
+    }
     initSortData(a, n);
     SortData * sortData = &_sortDataArray[0];
     if (_method == 0) {

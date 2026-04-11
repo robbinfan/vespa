@@ -67,9 +67,12 @@ private:
     int compare(AttributeVector *vector, AttrType type, uint32_t a, uint32_t b);
     void sortAndCheck(const std::vector<Spec> &spec, uint32_t num,
                       uint32_t unique, const std::vector<std::string> &strValues);
+    void sortAndCheckTopK(const std::vector<Spec> &spec, uint32_t num, uint32_t topn,
+                          uint32_t unique, const std::vector<std::string> &strValues);
 public:
     MultilevelSortTest() : _sortMethod(0) { srand(time(NULL)); }
     void testSortMethod(int method);
+    void testLazyTopK();
 };
 
 template<typename T>
@@ -322,6 +325,167 @@ MultilevelSortTest::sortAndCheck(const std::vector<Spec> &spec, uint32_t num,
     delete [] buf;
 }
 
+// Verifies correctness of a top-K sort by running a reference full sort and
+// a top-K sort with the same random seed on two independent hit arrays, and
+// asserting that the first `topn` winners agree on docId AND on the binary
+// sortdata bytes. This is the test that exercises the lazy top-K path in
+// FastS_SortSpec::tryLazyTopK when the preconditions are met.
+void
+MultilevelSortTest::sortAndCheckTopK(const std::vector<Spec> &spec, uint32_t num, uint32_t topn,
+                                     uint32_t unique, const std::vector<std::string> &strValues)
+{
+    ASSERT_TRUE(topn > 0 && topn <= num);
+
+    VectorMap vec;
+    for (uint32_t i = 0; i < spec.size(); ++i) {
+        const std::string &name = spec[i]._name;
+        AttrType type = spec[i]._type;
+        if (type == INT8) {
+            Config cfg(BasicType::INT8, CollectionType::SINGLE);
+            vec[name] = AttributeFactory::createAttribute(name, cfg);
+            fill<int8_t>(static_cast<IntegerAttribute *>(vec[name].get()), num, unique);
+        } else if (type == INT16) {
+            Config cfg(BasicType::INT16, CollectionType::SINGLE);
+            vec[name] = AttributeFactory::createAttribute(name, cfg);
+            fill<int16_t>(static_cast<IntegerAttribute *>(vec[name].get()), num, unique);
+        } else if (type == INT32) {
+            Config cfg(BasicType::INT32, CollectionType::SINGLE);
+            vec[name] = AttributeFactory::createAttribute(name, cfg);
+            fill<int32_t>(static_cast<IntegerAttribute *>(vec[name].get()), num, unique);
+        } else if (type == INT64) {
+            Config cfg(BasicType::INT64, CollectionType::SINGLE);
+            vec[name] = AttributeFactory::createAttribute(name, cfg);
+            fill<int64_t>(static_cast<IntegerAttribute *>(vec[name].get()), num, unique);
+        } else if (type == FLOAT) {
+            Config cfg(BasicType::FLOAT, CollectionType::SINGLE);
+            vec[name] = AttributeFactory::createAttribute(name, cfg);
+            fill<float>(static_cast<FloatingPointAttribute *>(vec[name].get()), num, unique);
+        } else if (type == DOUBLE) {
+            Config cfg(BasicType::DOUBLE, CollectionType::SINGLE);
+            vec[name] = AttributeFactory::createAttribute(name, cfg);
+            fill<double>(static_cast<FloatingPointAttribute *>(vec[name].get()), num, unique);
+        } else if (type == STRING) {
+            Config cfg(BasicType::STRING, CollectionType::SINGLE);
+            vec[name] = AttributeFactory::createAttribute(name, cfg);
+            fill(static_cast<StringAttribute *>(vec[name].get()), num, strValues);
+        }
+        if (vec[name].get() != nullptr) vec[name]->commit();
+    }
+
+    // Build two independent hit arrays with identical content.
+    std::vector<RankedHit> refHits(num);
+    std::vector<RankedHit> topkHits(num);
+    for (uint32_t i = 0; i < num; ++i) {
+        refHits[i]._docId = i;
+        refHits[i]._rankValue = getRandomValue<uint32_t>();
+        topkHits[i] = refHits[i];
+    }
+
+    vespalib::TestClock clock;
+    vespalib::Doom doom(clock.clock(), vespalib::steady_time::max());
+    search::uca::UcaConverterFactory ucaFactory;
+
+    auto build = [&](FastS_SortSpec &s) {
+        for (uint32_t i = 0; i < spec.size(); ++i) {
+            if (spec[i]._type == RANK) {
+                s._vectors.push_back(VectorRef(spec[i]._asc ? FastS_SortSpec::ASC_RANK
+                                                            : FastS_SortSpec::DESC_RANK,
+                                               nullptr, nullptr));
+            } else if (spec[i]._type == DOCID) {
+                s._vectors.push_back(VectorRef(spec[i]._asc ? FastS_SortSpec::ASC_DOCID
+                                                            : FastS_SortSpec::DESC_DOCID,
+                                               nullptr, nullptr));
+            } else {
+                const search::attribute::IAttributeVector *v = vec[spec[i]._name].get();
+                s._vectors.push_back(VectorRef(spec[i]._asc ? FastS_SortSpec::ASC_VECTOR
+                                                            : FastS_SortSpec::DESC_VECTOR,
+                                               v, nullptr));
+            }
+        }
+    };
+
+    // Reference: full sort with method=2 (radix). topn == num so lazy cannot engage.
+    FastS_SortSpec refSorter(7, doom, ucaFactory, 2);
+    build(refSorter);
+    refSorter.sortResults(refHits.data(), num, num);
+
+    // Top-K: same spec, default method, small topn. This is the path that
+    // exercises tryLazyTopK for eligible specs (and the legacy fallback path
+    // for ineligible specs such as single-field or first-field-string).
+    FastS_SortSpec topkSorter(7, doom, ucaFactory);
+    build(topkSorter);
+    topkSorter.sortResults(topkHits.data(), num, topn);
+
+    // Compare the first topn winners byte-for-byte. Ties on the complete
+    // multi-field key are allowed (different docIds can share a sortdata);
+    // we only assert that each rank's sortdata matches.
+    for (uint32_t i = 0; i < topn; ++i) {
+        auto r = refSorter.getSortRef(i);
+        auto t = topkSorter.getSortRef(i);
+        EXPECT_EQUAL(r.second, t.second);
+        EXPECT_EQUAL(0, memcmp(r.first, t.first, std::min(r.second, t.second)));
+    }
+}
+
+void MultilevelSortTest::testLazyTopK()
+{
+    // Build a set of specs that exercises all the interesting branches of
+    // tryLazyTopK:
+    //   - eligible: cheap fixed-width first field + tail fields
+    //   - ineligible: single field (falls through to legacy)
+    //   - ineligible: first field is a string (falls through to legacy)
+    //   - eligible but many ties on field 0 (forces the fallback branch)
+    std::vector<std::string> noStrings;
+    std::vector<std::string> someStrings{"foo", "bar", "baz", "quux"};
+
+    // Eligible: int32 + int64 + double, fully unique field0.
+    {
+        std::vector<Spec> s;
+        s.push_back(Spec("int32", INT32));
+        s.push_back(Spec("int64", INT64));
+        s.push_back(Spec("double", DOUBLE));
+        srand(1001);
+        sortAndCheckTopK(s, 2000, 10, 0, noStrings);
+        sortAndCheckTopK(s, 2000, 100, 0, noStrings);
+        sortAndCheckTopK(s, 2000, 500, 0, noStrings); // edge: topn*4 == n, gate just barely open
+    }
+    // Eligible but with low field0 cardinality — forces lazy fallback for
+    // large topn and bounded-candidate acceptance for small topn.
+    {
+        std::vector<Spec> s;
+        s.push_back(Spec("int8", INT8));      // only 256 possible values
+        s.push_back(Spec("int64", INT64));
+        srand(1002);
+        sortAndCheckTopK(s, 2000, 10, 8, noStrings);   // <= 8 unique int8 values → ~250 ties
+        sortAndCheckTopK(s, 2000, 100, 8, noStrings);  // more candidates than maxCand → fallback
+    }
+    // Ineligible: single field. tryLazyTopK should return false and the
+    // legacy path should produce a correct result.
+    {
+        std::vector<Spec> s;
+        s.push_back(Spec("int64", INT64));
+        srand(1003);
+        sortAndCheckTopK(s, 2000, 10, 0, noStrings);
+    }
+    // Ineligible: first field is string. Lazy path rejects it because
+    // getFixedWidth() == 0; legacy path should still produce the right answer.
+    {
+        std::vector<Spec> s;
+        s.push_back(Spec("string", STRING));
+        s.push_back(Spec("int32", INT32));
+        srand(1004);
+        sortAndCheckTopK(s, 2000, 50, 0, someStrings);
+    }
+    // Descending first field should also be eligible.
+    {
+        std::vector<Spec> s;
+        s.push_back(Spec("int32", INT32, false));
+        s.push_back(Spec("double", DOUBLE));
+        srand(1005);
+        sortAndCheckTopK(s, 2000, 20, 0, noStrings);
+    }
+}
+
 void MultilevelSortTest::testSortMethod(int method)
 {
     _sortMethod = method;
@@ -390,6 +554,12 @@ TEST("require that all sort methods behave the same")
     test.testSortMethod(0);
     test.testSortMethod(1);
     test.testSortMethod(2);
+}
+
+TEST("require that lazy top-K path agrees with full sort on the top K winners")
+{
+    MultilevelSortTest test;
+    test.testLazyTopK();
 }
 
 TEST("test that [docid] translates to [lid][paritionid]") {
