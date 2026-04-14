@@ -768,7 +768,7 @@ flowchart TB
     GET --> APPLY[apply DocumentUpdate<br/>到 prevDoc]
     APPLY --> SER[重新 serialize]
     SER --> FUT[填充 FutureDoc + FutureStream]
-    FUT --> FO1[updateIndexedFields<br/>if indexed fields touched]
+    FUT --> FO1["updateIndexedFields<br/><b>整 doc 全部 indexed field 重索引</b><br/>💥 N× 写放大"]
     FUT --> FO2[updateAttributes<br/>struct field path]
     FUT --> FO3[putSummary<br/>写回整行 doc]
     FO1 --> DONE2[OnDone → ack]
@@ -777,16 +777,18 @@ flowchart TB
 
     style FAST fill:#C8FFC8
     style SLOW fill:#FFD4D4
+    style FO1 fill:#FFAAAA
 ```
 
 **快路径（左分支）**：只有一条 fan-out，只动 attribute。写入延迟可以低到微秒级。  
-**慢路径（右分支）**：有一次 DocStore **读**（随机 IO）+ 反序列化 + 重新应用 update + 再序列化 + DocStore **写**，延迟是快路径的几十倍到上百倍。
+**慢路径（右分支）**：有一次 DocStore **读**（随机 IO）+ 反序列化 + 重新应用 update + 再序列化 + DocStore **写**，**外加**整 doc 所有 indexed field 的 reindex（详见 §5.5）。延迟是快路径的几十倍到上百倍。
 
 因此**识别 update 是否进入快路径**是工程优化的关键。代码锚点：
 
-- `UpdateScope::onUpdateField`（`storeonlyfeedview.h:125-133`）——**每个被 update 的 field 都会调用一次**。只要有一个 field 不是 `AttributeVector::isUpdateableInMemoryOnly()`，就置 `_nonAttributeFields=true`；
+- `UpdateScope::onUpdateField`（`storeonlyfeedview.h:125-133`）——**每个被 update 的 field 都会调用一次**。只要有一个 field 不是 `AttributeVector::isUpdateableInMemoryOnly()`，就置 `_nonAttributeFields=true`；只要有一个 indexed field 被 touch，就置 `_indexedFields=true`；
 - `isUpdateableInMemoryOnly` 对于 tensor、enum-based string、HNSW 都可能返回 false；
 - **一个典型坑**：给 string 字段加上 `match: substring` 或改变 dictionary 类型，会让原本快路径的 update 突然变慢。
+- **另一个更隐蔽的坑（§5.5）**：哪怕只是动了一个 indexed field，整 doc 的所有 indexed field 都被重新 tokenize + 写 posting。
 
 ### §5.4 Move：跨 Sub-DB 搬迁的两端写
 
@@ -807,6 +809,69 @@ sequenceDiagram
 ```
 
 两侧共享同一个 `OnDone`，避免中间状态被外部观察。
+
+### §5.5 Update 慢路径的隐藏写放大
+
+**这是 Vespa 设计里最容易让人误解的地方**：API 是 partial update，看似只动一个字段；但是只要落入慢路径，**整 doc 的所有 indexed field 都会被重新 tokenize 并写 posting list**。partial 在 API 层是 partial，在 index 写入层是 full。
+
+#### 写放大量化
+
+```mermaid
+flowchart LR
+    U["UpdateOperation<br/>只动 1 个 field"] --> SLOW[慢路径]
+    SLOW --> DSREAD["DocStore.get(lid)<br/>读整行 doc"]
+    DSREAD --> APPLY["apply update<br/>得到 newDoc"]
+    APPLY --> IDX["index reindex<br/>遍历 schema 全部 N 个 indexed field"]
+    APPLY --> DSWRITE["DocStore.put<br/>写整行 newDoc"]
+    APPLY --> ATTR["attribute update<br/>(touched 字段)"]
+
+    IDX --> F1["field 1: tokenize + posting"]
+    IDX --> F2["field 2: tokenize + posting"]
+    IDX --> FN["... field N: tokenize + posting"]
+
+    style IDX fill:#FFAAAA
+    style F1 fill:#FFD4D4
+    style F2 fill:#FFD4D4
+    style FN fill:#FFD4D4
+```
+
+假设 doc 有 10 个 indexed field，理想 partial 成本 C/10：
+
+| 路径 | Index CPU | DocStore IO | 写放大 |
+|---|---|---|---|
+| 期望 partial | C/10 | 0 | 1× |
+| Vespa 实际慢路径 | **C** | 整行读 + 整行写 | **10×** |
+| Vespa 快路径（attr-only） | 0 | 0 | 0 |
+
+#### 为什么必须这样做：跨字段一致性
+
+不是设计疏忽，而是**搜索一致性的强制要求**。完整原因有 5 个层面：
+
+1. **MemoryIndex 数据结构没有 per-field-per-lid 版本号**。一个 lid 的所有字段共享同一个 `_removedDocs` bitmap 和同一个 generation。要做 per-field 增量，等于在每个 posting entry 里多带 fieldGen 字段——全局结构改造。
+
+2. **跨字段查询（fieldset / multi-field BM25F）**需要 lid 在所有相关 field 上呈现"同一时刻快照"。允许 per-field 增量后，`f1` 取自 t1 状态、`f2` 取自 t2 状态，rank 信号基于一个**逻辑上从未存在过的 doc**计算，会出现幽灵 hit。
+
+3. **Source blender / 跨 source 合并**：MemoryIndex shard、DiskIndex shard 在查询时由 source blender 合并。每个 source 内部 doc 必须自洽，否则 blend 出 Frankenstein 结果。
+
+4. **Phrase / NEAR / 位置算子**依赖 token positions。Position 是按"整 doc 一次 tokenize"的维度组织的，部分更新位置容易越界或穿插。
+
+5. **Snippet / bolding 重建**：原文从 docstore 取，高亮位置从 index posting 取。两者时间线必须对齐。
+
+#### 这条规则的工程含义（电商场景特别重要）
+
+- **schema 上每多加一个 indexed field，每条 update 的潜在最坏代价 ×N**。给 indexed field 加 `match: substring`、`tensor index`、`stemming`、`gram` 都会让单字段 reindex 成本本身也变贵；
+- **快路径 vs 慢路径的代价是悬崖式跳变，不是连续的**：触发条件是"任一字段不满足 in-place 条件"。业务方加一个 `index: name` 看似无害，实际把整条 update 路径成本提一个数量级；
+- **`_docStoreFields` 那类优化（§6）即使逻辑写对，也只能省下"读+写整行 doc"那部分**，省不了 reindex 的 N×。所以那次回滚某种意义上"少干了一半"。
+
+#### 何时这条规则可以放松（编译期判定）
+
+并非所有 schema 都需要跨字段一致性。如果一个 indexed field 满足：
+- 不参与任何 fieldset；
+- 不参与跨字段 phrase / proximity；
+- 不被 BM25F 类多字段 ranking profile 用到；
+- 没有自定义 rank expression 同时引用它和其他字段；
+
+理论上可以 per-field 独立 reindex（§11.B5 详述）。但 Vespa 主线没有这个判定——保守起见全部 reindex。
 
 ---
 
@@ -887,6 +952,77 @@ void StoreOnlyFeedView::internalPut(...) {
 ### §6.5 一段有意思的观察：replay 时没这个 bug
 
 因为 TLS 里存的是完整 `DocumentUpdate` / `Put` 的序列化形式。Replay 时 FeedHandler 会**重放完整 op**，进入和正常写一样的 FeedView 路径。如果你的错误修改逻辑是在写入路径上跳过 docstore，replay 后也会**复现**这个问题——**不是 crash recovery 就能救回来**。这也是当年这类 bug 难发现的原因：测试集里单条 put+get 过得去，一碰 update + restart 就炸。
+
+### §6.6 真实案例复盘：`_docStoreFields` 字段集过滤
+
+业界有过一个实际尝试（这里以"MR !563"代称，后被 MR !568 回滚）：试图在 update 慢路径里，**按字段过滤**哪些字段写回 docstore。实现大致：
+
+```cpp
+// 构造时（schema 加载阶段）：
+_docStoreFields = 所有字段 - isAttributeField 的字段
+// 推理：attribute field 可以从 attribute 读回，docstore 不需要存
+
+// update 路径的 makeUpdatedDocument:
+newDoc = make_unique<Document>(*_repo, *_docType, update.getId());  // 从零构造
+for (fieldUpdate : update.getUpdates()) {
+    if (_docStoreFields.contains(field.getName())) {
+        fieldUpdate.applyTo(*newDoc);
+    }
+}
+// 然后只把 _docStoreFields 里的字段从 prevDoc 拷过来
+```
+
+**它为什么坏**——精准对应 §6.2 的错误模式：
+
+| 字段类型 | 写入行为 | 读取后果 |
+|---|---|---|
+| 纯 indexed（非 attribute） | 在 `_docStoreFields` 里 → apply update + 拷 prevDoc → 正常 | OK |
+| `attribute` only | 不在 `_docStoreFields` 里 → 跳过 → docstore 缺字段 | summary 渲染缺字段（除非 summary 配了 source: attr） |
+| `attribute + index`（电商最常见） | **不在 `_docStoreFields` 里** → 跳过 → docstore 缺字段 | summary 渲染缺字段，且 reindex 时如果换 schema 会丢 |
+| `attribute + summary` | 跳过 → docstore 缺字段 | summary 渲染依赖 retriever 的 attribute fallback，不稳定 |
+
+根因：`isAttributeField()` 的语义是"该字段在 attribute 里有一份"，**不等于**"summary 渲染会从 attribute 读"。Vespa 的 summary 默认走 docstore（除非 schema 里写了 `summary X { source: attribute_name }`），所以"是 attribute" 不构成 "可以跳过 docstore"。
+
+**回滚后的最简正确版**（MR !568）：
+
+```cpp
+newDoc = std::move(prevDoc);          // 全字段保留
+if (useDocStore) {
+    update.applyTo(*newDoc);          // 全量 apply
+    newDoc->serialize(newStream);     // 全字段写回
+}
+```
+
+正确但**不做任何优化**。
+
+#### 这个案例真正的教训
+
+1. **判定维度错了**：不应该按"字段是否是 attribute"判定，而应按"该字段是否被 summary/docstore 读路径需要"判定。后者要看 schema 的 summary class 配置 + rank profile + 哪些 access path 用到。
+2. **粒度错了**：字段级过滤会导致 doc 的中间状态（部分字段是新、部分字段是旧）写入 docstore——任何后续 reindex / migrate / cross-schema-evolution 都会暴露。正确粒度是**整 update 级判定**：要么全跳过 docstore（when no field needs docstore），要么走完整慢路径不裁剪。
+3. **优化范围被高估**：即使逻辑对，省下的只是 docstore IO 那部分；§5.5 揭示的 N× 索引写放大它根本没碰。所以这个优化在最好情况下也只解决问题的一半。
+4. **测试不充分**：这种 bug 在 "put → get" 的单元测试覆盖不到，必须用 "put → update(touch attr field) → get / restart-then-get" 的组合用例才能触发。Vespa 主线 acceptance test 里这种组合应该补齐。
+
+#### 正确版的 schema-aware 优化（详见 §11.A8 + §11.B5）
+
+要重做这个优化，正确路径是：
+
+```text
+schema 加载时静态分析：
+  needs_docstore[F] = 
+       (F 在某 summary class 中且该 class 没有 source: 重定向)
+    OR (F 是 indexed 且没有原文重建的 attribute 副本)
+    OR (F 有非 attribute 子字段)
+
+update 路径（整 update 级）：
+  if ∀ touched F: NOT needs_docstore[F]:
+      skip makeUpdatedDocument 全部
+      skip putSummary
+      只走 updateAttributes
+  else:
+      正常慢路径，全字段 apply（不做字段裁剪）
+```
+
+注意第一个分支的命中条件已经接近 §5.3 的"attr-only fast path"——如果同时所有 touched field 又都是 in-memory updateable，本质就是 fast path。所以这个优化的真正增量是：**对部分 touched 字段是 attribute 但 attribute commit 较重的场景，省下 docstore 一侧的 IO**。增量收益小，工程复杂度大——这也是为什么 Vespa 主线一直没采纳类似优化。
 
 ---
 
@@ -1347,6 +1483,188 @@ flowchart LR
 - 按 bucket 排好后，一次 IO 能拿到一段连续的 doc，random read → sequential read；
 - 写入路径不直接受益，但写入完成后的 background flush + compact 让"未来读"更快。
 
+### §10.7 Two-phase remove：稀疏命中场景的协议优化
+
+#### 问题：标准 remove 路径对空命中很贵
+
+电商场景下大量 remove 的目标 docid 实际并不存在于本节点（重复清理、跨业务幂等重试、catalog 全量 sync 的 delete-then-insert 等）。Vespa 标准 remove 路径**对存在与否一视同仁**：
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant D as Distributor
+    participant N1 as Node 1 (Proton)
+    participant N2 as Node 2 (Proton)
+    participant N3 as Node 3 (Proton)
+
+    C->>D: remove(gid)
+    D->>D: hash(gid) → bucket → 3 replicas
+    par 全副本并行
+        D->>N1: Remove RPC
+        N1->>N1: TLS append (即使空命中也写)
+        N1->>N1: FeedHandler master 线程占用
+        N1->>N1: DMS.inspect(gid) → 不存在
+        N1->>N1: 早退（不 fan-out）
+        N1-->>D: ack
+    and
+        D->>N2: 同上
+    and
+        D->>N3: 同上
+    end
+    D-->>C: ack
+```
+
+**空命中的真实代价**（每次 remove）：
+1. **TLS 写 × N 副本**：fsync 排队，影响有效 doc 写延迟；
+2. **Master 线程 task slot × N 副本**：FeedHandler master 是单线程瓶颈；
+3. **DMS BTree 查询 × N 副本**：内存带宽消耗在累加；
+4. **网络往返 × N 副本**。
+
+#### Two-phase 协议
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant D as Distributor
+    participant N1 as Node 1
+    participant N2 as Node 2
+    participant N3 as Node 3
+
+    C->>D: remove(gid)
+    D->>D: hash(gid) → bucket → 3 replicas
+
+    Note over D: Phase 1: probe (lookup-only)
+    par 并行轻量探测
+        D->>N1: ProbeExists(gid, bucket)
+        N1->>N1: DMS.inspect(gid) only<br/>不写 TLS, 不进 FeedHandler
+        N1-->>D: not_found
+    and
+        D->>N2: ProbeExists
+        N2-->>D: not_found
+    and
+        D->>N3: ProbeExists
+        N3-->>D: not_found
+    end
+
+    alt 全部 not_found
+        D-->>C: ack (no-op)
+        Note over D,N3: TLS / 主线程都未触碰
+    else 至少一个 found
+        Note over D: Phase 2: 真删
+        D->>N1: Remove (only to nodes that found it)
+        N1->>N1: 完整流水线<br/>TLS + FeedHandler + DMS.remove + fan-out
+        D-->>C: ack
+    end
+```
+
+要点：
+- Probe 走 lookup-only 路径，不进 `FeedHandler::performRemove`；可以挂在 `PersistenceEngine` 上加 SPI `probeRemove(gid, bucket) → bool`；内部走 `IDocumentMetaStoreContext::inspect`，无锁 RCU 读；
+- Probe **不写 TLS**——只读不修改状态；
+- 理想实现：probe 走 **search 线程池**而不是 feed 线程池，与写流量物理隔离；
+- Phase 2 只发给"自报有"的副本，进一步省 TLS / 网络。
+
+#### Batched probe（你们的实现包含此优化）
+
+电商批量清理通常一次几千上万条 remove 并发到达。逐条 probe 仍有 RPC 开销。批量化：
+
+```text
+Distributor 侧：
+  在 1ms 窗口内聚合所有 probe 请求，按 (replica node, bucket) 分组
+  对每个 (node, bucket) 组发出一次 ProbeBatch RPC：
+    ProbeBatch(bucket, vector<gid>) → bitmap
+```
+
+```mermaid
+sequenceDiagram
+    participant D as Distributor
+    participant N as Proton Node
+    participant DMS as DocumentMetaStore
+
+    D->>D: aggregate window (1ms)<br/>按 node+bucket 分组
+    D->>N: ProbeBatch(bucket, [gid1, gid2, ..., gid1000])
+    N->>DMS: 批量 inspect (利用 BTree 局部性)
+    DMS->>DMS: 同 bucket 的 gid 在 B+tree 局部接近<br/>cache friendly
+    DMS-->>N: bitmap [1000 bits]
+    N-->>D: ProbeBatchResp(bitmap)
+
+    Note over D: 解 bitmap，分流到 phase 2
+    par 命中位
+        D->>N: Remove(gid_i) (only for set bits)
+    and 未命中位
+        D->>D: 对 client 直接 ack
+    end
+```
+
+效果：
+- 单次 probe 摊销成本接近 BTree node 一次内存访问；
+- DMS 的 inspect 在同 bucket gid 上有空间局部性，cache miss 显著降低；
+- 网络包数从 N 降到 1。
+
+#### Bloom filter 预过滤（你们的实现包含此优化）
+
+更进一步：probe 还是要发 RPC，能不能在 distributor 本地就拒掉一部分？
+
+```mermaid
+flowchart LR
+    NODE[Proton Node] -->|定期推送<br/>per-bucket bloom| DIST[Distributor]
+    DIST -->|内存维护<br/>bucket → bloom| BF[Bloom Map]
+
+    REQ[remove req] --> CHK{BF.contains gid?}
+    CHK -->|不可能存在<br/>bloom miss| FAST[直接 ack client]
+    CHK -->|可能存在<br/>bloom hit| PROBE[发 ProbeBatch]
+    PROBE --> P2[normal two-phase]
+```
+
+机制：
+- 每个 Proton 节点定期（比如每 30s 或 commit 后）把 per-bucket 的 gid 集合做成 bloom filter，推送给 distributor；
+- Distributor 内存维护 `(node, bucket) → bloom`；
+- 收到 remove 时本地查 bloom：
+  - bloom miss（确定不在）→ 直接 ack，省掉 probe；
+  - bloom hit（可能在）→ 走 batched probe 确认。
+
+设计要点：
+- **Bloom 假阳率**：5% 即可，几 KB per bucket；
+- **Bloom 时效**：bloom 滞后于真实状态——但只会让"实际不存在的 gid 被 bloom 误判存在"，不会让"存在的 gid 被 bloom 漏报"。误判只是降低优化效果，不破坏正确性；
+- **Bloom 失效**：节点重启 / bucket 迁移后 bloom 无效，distributor 在 bloom 收到之前对该 bucket 一律走完整 probe；
+- **Bloom 更新策略**：增量更新（每个新 put 推 delta）vs 周期性全量重建——后者实现简单，前者带宽小。
+
+#### 协议正确性边界
+
+**1. 一致性窗口**：probe 返回 not_found 后到 phase 2 之间，可能并发 put 把这条 gid 写进来。结果是这条新 put 留下、remove 没生效。
+
+- 客户端 remove 时 doc 还不存在 → 删不删都满足 idempotent 语义；
+- 不要给 probe 加 test-and-set 语义（成本会回到原点）；
+- 如果业务确实需要 strict serialize，用 Vespa 的 `condition` 字段走完整路径。
+
+**2. 副本不一致时的修复**：probe 只查 active replica 集；retired 或 down 的副本里残留的 doc 由后续 bucket merge 修复，不影响 two-phase 协议的正确性。
+
+**3. 与 1.removed sub-db 的关系**：Vespa 标准做法是 remove existing doc 在 `1.removed` sub-db 留 tombstone，作用是跨副本 merge 的存在性证据。
+
+- 全副本都 not_found → 不需要 tombstone（这条 gid 在所有 active 副本上从未存在过）；
+- 部分副本 found → 那些副本走完整 remove，正常生成 tombstone；
+- 协议**自然兼容**现有 tombstone 机制。
+
+**4. Idempotent retry**：distributor 重发 remove 时，phase 1 已经无副本有 doc，自动 short-circuit。比标准协议更节能。
+
+#### 代价矩阵
+
+| 方案 | 网络 RPC | TLS 写 | Master 线程 | DMS 查询 | 客户端延迟 |
+|---|---|---|---|---|---|
+| 标准 remove | 3 (3 副本) | 3 fsync | 3 任务 | 3 inspect | 1× RPC RTT |
+| Two-phase（空命中） | 3 (probe) | 0 | 0 | 3 inspect | 1× RPC RTT |
+| Two-phase + batched probe | ~1 (batch) | 0 | 0 | 1 batch inspect | 1× RPC RTT |
+| Two-phase + batched + bloom | 0（命中 bloom miss） | 0 | 0 | 0 | 0（本地完成） |
+
+每一层叠加都把 N 副本的"重复成本"压一个量级。
+
+#### 可推广的协议族：cost-aware ops
+
+Two-phase remove 是一类思路的代表。同样的 probe + 条件下推可以推广到：
+
+- **two-phase put-if-not-exists**：先 probe，存在则跳过 put（电商 catalog 增量 sync 常见）；
+- **two-phase update-if-exists**：不存在则不发 update，避免空 update 走 FeedHandler（虽然空 update 在 Vespa 里也是 no-op，但仍然走 master 线程）；
+- **conditional batch ops with bucket-level summary**：bloom + min/max checksum，适合"按某 bucket 的状态分流写"。
+
 ---
 
 ## §11 写入优化分析
@@ -1444,6 +1762,58 @@ flowchart LR
 - 或按 lid hash 分桶降低锁粒度；
 - 写入 fan-out 极高时（攒 100 条 doc），tracker 是潜在热点。
 
+#### A11. Update 聚合窗口（**未实现的提案**，对电商场景收益最大）
+
+**问题**：电商同一个 SKU 一天可能被改 50 次价格 + 20 次库存。如果有任何 indexed field 被 touch，每次都触发完整 §5.5 的 N× 写放大。
+
+**优化**：在 FeedHandler 入口处加一个 **per-lid 聚合窗口**：
+
+```mermaid
+flowchart LR
+    OPS[incoming ops] --> AGG[Aggregator<br/>per-lid 队列<br/>窗口 W ms]
+    AGG -->|窗口结束| MERGE[merge updates<br/>对同一 lid 折叠]
+    MERGE --> FH[FeedHandler]
+```
+
+折叠规则（伪代码）：
+
+```text
+window_buffer: lid → list<UpdateOperation>
+
+on incoming op:
+    if op.type == update:
+        window_buffer[lid].append(op)
+    else if op.type == put or remove:
+        flush window_buffer[lid] then process op directly
+
+on window_timer (every W ms):
+    for each (lid, ops) in window_buffer:
+        merged = ops[0]
+        for op in ops[1:]:
+            merged = merge(merged, op)   # 后写覆盖前写
+        emit merged to FeedHandler
+        clear window_buffer[lid]
+```
+
+**收益**：
+- N 次 update 折叠成 1 次 → makeUpdatedDocument 调用次数 ÷ N；
+- index reindex 次数 ÷ N（写放大常数 N 不变，但**频率**降到 1/N，对总写量是除法）；
+- DocStore IO ÷ N；
+- 唯一代价：业务侧最多增加 W ms 可见性延迟（typically 100ms–1s 完全可接受）。
+
+**实现复杂度**：
+- 折叠 `assign` 类 update：直接后值覆盖前值，简单；
+- 折叠 `add` / `remove` to weighted set / map：需要小型状态机（保留所有 add/remove 操作的代数和）；
+- 折叠 `arithmetic`（increment N）：可以累加；
+- 折叠 `tensor modify`：要看是 replace 还是 cell-level update。
+
+**风险**：
+- 上游事务保证：如果业务依赖"每次 update 都被独立确认"，需要 client API 改成"窗口 ack"或者保留原生 ack；
+- Replay 重放后逻辑：折叠应该是**幂等的**——窗口内重复 op 折叠后等价于一条 op。
+
+**工程难度**：中等（一个独立组件，不侵入 FeedView/SubDB）。  
+**预期收益**：电商高频热点 SKU 的 update 写量 **下降 80–95%**。
+
 ### §11.B 架构级（4 条）
 
 #### B1. 编译期特化的 FeedView
@@ -1486,7 +1856,78 @@ RPC → [ParseDoc] → [Field demux] → [AttrPipe×N | IndexPipe | SummaryPipe]
 
 - 引入"hot tier"：最近 N 分钟的 doc 内存常驻（不只是 page cache）；
 - "cold tier"：旧 doc 走 LogDocumentStore；
-- update 慢路径首次 read 命中 hot tier → 快路径化。
+- update 慢路径首次 read 命中 hot tier → 快路径化；
+- 极端版本：mem-only docstore——见 §12.4。
+
+#### B5. Per-field independent reindex（缓解 §5.5 写放大的根治方案）
+
+**现状**：§5.5 描述的 N× 写放大——任意一个 indexed field 被 update 都触发整 doc 全字段 reindex，因为 MemoryIndex 没有 per-field-per-lid 版本号，跨字段一致性靠"整 doc 一起换"维持。
+
+**核心观察**：并非所有 field 都需要跨字段一致性。一个 field F 可以独立 reindex 当且仅当：
+1. F 不参与任何 fieldset；
+2. F 不参与跨字段 phrase / proximity / NEAR；
+3. F 不被 BM25F 类多字段 ranking profile 用到；
+4. 没有自定义 rank expression 同时引用 F 和其他 field；
+5. F 不被任何 grouping / aggregation 与其他 field 联合使用。
+
+**优化**：编译期（schema + rank profile 加载时）对每个 field 计算 `independent_reindex[F]` 标志：
+
+```text
+independent_reindex[F] = true ⟺
+    F ∉ any fieldset
+    AND F ∉ any phrase/near/onear context across fields
+    AND F ∉ any rank-expression cross-reference set
+    AND F 不参与跨字段 grouping
+```
+
+FeedView 在慢路径里：
+
+```cpp
+void SearchableFeedView::performIndexUpdate(newDoc, touched_fields) {
+    for (field : schema.indexedFields()) {
+        if (touched_fields.contains(field) || !independent_reindex[field]) {
+            indexMaintainer.reindexField(lid, field, newDoc);
+        }
+        // else: skip
+    }
+}
+```
+
+**收益**：对独立性高的 schema（多数电商 attr-style 短 field），写放大从 N 降到"实际 touched 字段数 + 受跨字段约束的字段数"。
+
+**风险**：
+- 编译期判定要保守——一旦判错会出现幽灵 hit；
+- Rank profile 修改后必须**强制重 build 全 index**（标志位失效），否则部分 lid 会处于不一致状态；
+- 对 substring / gram / stemming 等改 token 的 field 需要特别小心（同 lid 不同字段的 position 计算独立时会有边界效应）。
+
+**实现层面**：MemoryIndex 已经按 field 分桶存 posting list（per-field 字典），结构上支持单 field 重写——主要工作量在编译期判定 + searcher 的一致性证明。
+
+#### B6. MemoryIndex Delta Overlay
+
+**思想**：保留"整 doc reindex" 的语义不动；引入一个**小型 overlay index** 专门存最近 update 的 per-field deltas；search 时合并主 index + overlay。
+
+```mermaid
+flowchart LR
+    UPDATE[Update touch field F] --> CHK{字段独立<br/>or 强一致?}
+    CHK -->|独立| OV[写入 Overlay<br/>per-field-per-lid posting]
+    CHK -->|强一致| MAIN[整 doc reindex<br/>到主 MemoryIndex]
+
+    SEARCH[Search] --> SO{先查 Overlay}
+    SO -->|有 lid 的覆盖| USE_OV[用 Overlay 版本]
+    SO -->|无| USE_MAIN[用主索引版本]
+
+    OV -->|周期 / 满 buffer| MERGE[Doc 级 fold-in<br/>合并回主索引]
+    MERGE --> MAIN
+```
+
+要点：
+- Overlay 是**版本化**的 per-(lid, field) 覆盖；写入时记录 `(lid, field, gen, posting)`；
+- Search 路径多一次 lookup（但 overlay 容量小，cache friendly）；
+- Overlay 满或定时触发 fold-in：把 overlay 里所有 update 在 doc 级一次性合并回主索引（保持跨字段一致）；
+- Fold-in 频率是 trade-off：频繁→主索引开销不省；稀疏→overlay 越来越大、search 变慢；
+- **配合 §11.A11 update 聚合窗口**：聚合窗口减少 update 次数，overlay 减少 update 单次成本，两者乘积式收益。
+
+**复杂度**：高（搜索路径需要改）；适合长期演进。
 
 ### §11.C 集群级（3 条）
 
@@ -1521,15 +1962,256 @@ RPC → [ParseDoc] → [Field demux] → [AttrPipe×N | IndexPipe | SummaryPipe]
 | A8 skip docstore (safe) | ++ | -- | | -- | 中 |
 | A9 TLS group commit | ++ | + | | | 低 |
 | A10 lock-free tracker | + | - | | | 中 |
+| **A11 update 聚合窗口** | **+++** | **+ (W ms 延迟)** | | | 中 |
 | B1 编译期 FeedView | ++ | - | | - | 高 |
 | B2 streaming pipeline | ++ | - | | | 高 |
 | B3 并行 replay | | | --- | + | 高 |
 | B4 docstore hot tier | + | -- | | + | 高 |
+| **B5 独立字段 reindex** | **+++** | **--** | | | 高（编译期分析）|
+| **B6 MemoryIndex delta overlay** | **+++** | **--** | | + | 高 |
 | C1 bucket-aware routing | + | - | | | 中（架构变更）|
 | C2 流量隔离 | | -- | | | 中 |
 | C3 update 副本共享 | + | -- | | | 高（协议变更）|
+| **§10.7 two-phase remove + bloom** | **++**（remove 工作量 ↓80%+） | **--** | | + (bloom mem) | 中 |
 
-> 表中 `+`/`++` 表示提升，`-`/`--` 表示下降（值更小 = 更好），空表示中性。
+> 表中 `+`/`++`/`+++` 表示提升程度，`-`/`--` 表示下降（值更小 = 更好），空表示中性。粗体行是新增的、对电商场景特别相关的优化。
+
+---
+
+## §12 电商场景 Playbook：Daily Rebuild + Real-time Stream
+
+本章把前面所有理论落到一个具体工作模式上：**每日 rebuild 一份新 index → 追实时 update 流 → 切流后稳态运行**。这是大型电商搜索的典型部署。下面按"三段写入 profile"分别给出可落地的优化清单。
+
+### §12.1 写入流程拆解
+
+```mermaid
+flowchart LR
+    subgraph T1["Phase 1: Bulk Build (几小时)"]
+        direction TB
+        B1[全量 source dump<br/>纯 put] --> B2[Memory Index<br/>积累成大块]
+        B2 --> B3[周期性 flush<br/>多个 disk shard]
+        B3 --> B4[最终一次 fusion]
+    end
+
+    subgraph T2["Phase 2: Catch-up (几分钟–几十分钟)"]
+        direction TB
+        C1[build 期间累积的<br/>op log] --> C2{op type?}
+        C2 -->|put| C3[直接 reindex 整 doc]
+        C2 -->|update| C4[💥 慢路径<br/>+ N× 写放大]
+        C2 -->|remove| C5[two-phase 已优化]
+    end
+
+    subgraph T3["Phase 3: Steady-state stream (24h)"]
+        direction TB
+        S1[实时业务 op 流] --> S2{大多数是?}
+        S2 -->|attr-only update| S3[fast path - 几乎免费]
+        S2 -->|index field update| S4[💥 N× 写放大]
+        S2 -->|remove| S5[two-phase 已优化]
+    end
+
+    T1 --> SWAP[流量切换<br/>蓝绿 / index swap]
+    SWAP --> T2
+    T2 --> T3
+```
+
+每段瓶颈不同：
+
+| 阶段 | 主要 op | 真正瓶颈 | 关键优化 |
+|---|---|---|---|
+| Phase 1 Build | 99% put | 顺序吞吐：MemoryIndex → Disk + Fusion | feed mode + 大 chunk + 延后 fusion |
+| Phase 2 Catch-up | put + update + remove | 取决于 catch-up 协议 | **把 update 折叠成 put**（关键） |
+| Phase 3 Steady | update 为主 | index N× 写放大 + DocStore IO | Tier 1 attr-only + §11.A11 聚合窗口 |
+
+### §12.2 Phase 1 Bulk Build 的优化
+
+Build 期间 index 不对外服务，可以彻底放飞：
+
+```yaml
+# 配置示例（说明性，具体配置项以 Vespa 版本为准）
+visibility-delay: infinity              # 不做 forceCommit
+flush:
+  memoryindex.maxsize: 4GB              # 比默认大一个数量级
+  attribute.maxage: never
+  summary.maxsize: huge
+fusion:
+  postpone-until-build-done: true       # build 结束再做一次大 fusion
+maintenance:
+  bucket-move: paused
+  shrink-lid: paused
+  compactBloat: paused
+tls:
+  group-commit: max
+distributor:
+  feed-replication: relaxed             # build 期间允许临时低副本数
+```
+
+要点：
+1. **延后 fusion**：build 期间产生的 disk index shard 不要小批量合并；build 结束做一次大 fusion，节省 IO；
+2. **加大 MemoryIndex flush 阈值**：减少 shard 数量 = 减少 fusion 输入；
+3. **关闭后台 maintainer**：bucket move / shrink lid / compactBloat 都是 build 完成后才有意义；
+4. **TLS group commit 放到最大**：build 期间 durability 要求低（崩了重 build）；
+5. **副本数临时降低**：distributor 临时只写 1 副本，build 完成再 merge 到全副本；
+6. **schema 验证关闭**：trusted source 不需要每条 doc 校验 schema；
+7. **Distributor 端 throttle 调高**：build 是 batch 流量，不需要"防业务流量打挂"的保守阈值。
+
+### §12.3 Phase 2 Catch-up：隐藏的杀手
+
+Catch-up 经常被低估。Build 几小时累积的 op，里面如果有大量 update + 触发慢路径，catch-up 时间可能比 build 本身还长，并且会和"刚切过来的真实流量"重叠。
+
+#### 离线折叠（推荐）
+
+如果上游 op log 带 timestamp，catch-up 之前先做一次离线折叠：
+
+```python
+# 折叠状态机伪代码
+def fold_op_log(ops):
+    """ops sorted by (docid, timestamp)"""
+    folded = {}  # docid → folded_state
+
+    for op in ops:
+        docid, ts, type_, payload = op
+
+        if docid not in folded:
+            folded[docid] = init_state()
+
+        s = folded[docid]
+        if type_ == 'put':
+            # put 完全覆盖之前的状态
+            s = {'final_op': 'put', 'doc': payload, 'ts': ts}
+        elif type_ == 'remove':
+            # remove 完全覆盖
+            s = {'final_op': 'remove', 'ts': ts}
+        elif type_ == 'update':
+            if s.get('final_op') == 'remove':
+                # remove 后又 update？业务异常，跳过
+                continue
+            elif s.get('final_op') == 'put':
+                # 把 update apply 到 put 的 doc 上
+                s['doc'] = apply_update(s['doc'], payload)
+                s['ts'] = ts
+            else:
+                # 累积 update，等遇到 put 或最终输出时统一
+                s.setdefault('updates', []).append(payload)
+                s['ts'] = ts
+
+        folded[docid] = s
+
+    # 输出
+    for docid, s in folded.items():
+        if s['final_op'] == 'remove':
+            yield ('remove', docid, s['ts'])
+        elif s['final_op'] == 'put':
+            yield ('put', docid, s['doc'], s['ts'])
+        elif 'updates' in s:
+            # 多条 update 累积，merge 成一条
+            merged = merge_updates(s['updates'])
+            yield ('update', docid, merged, s['ts'])
+```
+
+折叠 update 时按操作类型处理：
+- `assign(field, value)`：后值覆盖前值；
+- `add_to_set(field, value)` / `remove_from_set`：保留所有操作的代数和；
+- `arithmetic(field, +N)`：累加；
+- `tensor_modify`：按 modify operation 类型决定（replace / multiply / add）。
+
+效果：
+- 100 次同 docid update → 1 次；
+- remove + 后续 put → put（doc 又活了）；
+- put + 后续 remove → remove；
+- catch-up 总 op 数下降 90%+。
+
+前提：上游有完整带 timestamp 的 op log，且 update 是 deterministic（不依赖 doc 当前值，比如不能用 `if-current-value-X-then-set-Y`）。
+
+#### 流式 catch-up（折叠不可行时）
+
+如果只能流式追：
+- **visibilityDelay 设大**（5–10s）：让 §11.A11 update 聚合窗口（如果实现了）合并同 lid 的多次 update；
+- **Catch-up 流量打到独立 executor 池**：与 steady-state 流量物理隔离（参考 §11.C2 流量隔离）；
+- **Catch-up 完成判定**：上游 op offset 追上 + N 秒空跑窗口 → 再切流。
+
+### §12.4 Phase 3 Steady-state：mem-first / mem-only docstore
+
+每天 rebuild 过 → docstore 的"持久"价值只有 24 小时。这给了一个独特的设计自由度：**docstore 可以做成 mem-only**。
+
+#### Mem-first（中等改造，§11.B4 的具体落地）
+
+在 SummaryAdapter 和 LogDocumentStore 之间加一层 buffered store：
+
+```mermaid
+flowchart LR
+    PUT[put/update] --> BUF[BufferedDocumentStore<br/>per-bucket ring buffer]
+    BUF -->|定期 / buffer 满| BATCH[batch serialize]
+    BATCH --> DISK[LogDocumentStore on disk]
+
+    GET[get lid] --> BUFLOOKUP{buffer 命中?}
+    BUFLOOKUP -->|是| RET1[直接返回]
+    BUFLOOKUP -->|否| DISKGET[从 disk 读]
+```
+
+实现要点：
+- `put(lid, doc)` 入内存 map，立即返回；
+- 后台线程按 N 条 / N 秒攒批，一次 serialize 多 doc 写盘（减少 syscall + chunk metadata）；
+- `get(lid)` 先查内存 buffer，miss 再走盘；
+- TLS 仍然 fsync —— crash 后可以 replay 重建 buffer + disk 一致状态；
+- 配合 visibilityDelay = 1–5s，让 forceCommit 把 batch 真正下盘。
+
+收益：写 IOPS ÷ N，DocStore 不再是写瓶颈。
+
+#### Mem-only（激进，但适合日 rebuild 场景）
+
+更进一步：DocStore 完全不下盘。
+
+实现：
+- 实现一个 `InMemoryDocumentStore` 满足 `IDocumentStore` 接口（`searchlib/docstore/idocumentstore.h`）；
+- `SummaryManager::createDocumentStore` 工厂分支挂上 mem-only 实现；
+- `IFlushTarget` 退化成 noop（或只在 fusion 节点 dump 一次给 cross-node merge）；
+- **重启走 TLS replay 全量重建** —— 这恰好和你"日 rebuild" 流程对齐（rebuild = 一次"全量 reset + replay"）。
+
+风险与缓解：
+| 风险 | 缓解 |
+|---|---|
+| 节点 OOM → tmpfs 内容丢 | TLS 完整 → replay 可恢复 |
+| 跨节点 merge 时 get(lid) | 内存命中即可 |
+| Fusion 后旧 disk index 删 | docstore 跟着删，OK（不需要持久） |
+| 重启耗时变长 | 配合 §11.B3 并行 replay 抵消 |
+
+代码触点：
+- `searchlib/docstore/idocumentstore.h` —— 接口；
+- `SummaryManager::createDocumentStore` —— 工厂分支；
+- `IFlushTarget` 实现 —— noop 或纯 GC 版本；
+- `compactBloat / compactSpread` —— 内存版本可以做"按 lid hash 重排"的 in-place GC。
+
+#### 终极方案：Docstore as cache（架构级）
+
+排序阶段只用 attribute（in-mem），不读 docstore；只有 top-K（≤50）docs 渲染时需要完整 body —— 这一步可以**回源到外部 KV**（你们自己的商品中心）。Vespa 退化成"index + attribute 引擎"。
+
+代价：失去 Vespa 自带 visit / migrate 的便利性；优势：写入路径完全没有 docstore 那一层 IO。
+
+### §12.5 综合优化菜单（按 ROI 排序）
+
+按"实施成本 / 收益"比从低到高：
+
+| 优先级 | 优化 | 实施位置 | 预期收益 |
+|---|---|---|---|
+| ★★★★★ | Schema 拆分：热写字段 attr-only | Schema 配置 | update 80%+ 走 fast path |
+| ★★★★★ | Two-phase remove + bloom（已实现） | Distributor + Proton SPI | remove 工作量 ↓80%+ |
+| ★★★★ | Catch-up 离线折叠 | 上游 pipeline | catch-up 时间 ↓80%+ |
+| ★★★★ | visibilityDelay 分级 + group commit | 配置 | 写吞吐 ↑2–5× |
+| ★★★ | Update 聚合窗口 (§11.A11) | FeedHandler 入口 | 热点 SKU 写量 ↓80%+ |
+| ★★★ | Mem-first docstore (§11.B4) | DocStore 层 | 写 IOPS ↓N× |
+| ★★ | 独立字段 reindex (§11.B5) | Schema 编译期 + IndexMaintainer | index 写放大 ↓ |
+| ★★ | Mem-only docstore (§12.4) | DocStore + Flush | 写 IO 完全消除 |
+| ★ | Delta overlay (§11.B6) | MemoryIndex + Search | 长期演进方向 |
+| ★ | Docstore as cache | 架构级 | 极致省 IO，失去 Vespa visit |
+
+### §12.6 一些常见反模式
+
+1. **每次价格变动 `put` 整个商品 doc**：必走慢路径 + N× reindex。改成 `update assign price`；
+2. **促销字段做 indexed**：促销标签变化频繁，indexed 让它每次进慢路径。改成 attribute + filter；
+3. **catch-up 时不区分 op，全量重放**：用了 update 就吃 N× 放大。先折叠再回放；
+4. **rebuild 时保持 visibilityDelay=0**：每次 commit 都 fork-join 5 个 executor，吞吐上不去。Build 期间设 infinity；
+5. **rebuild 完直接切流，不等 catch-up 完**：业务收到的 doc 状态比 prev rebuild 旧。先确保 catch-up 追上再切；
+6. **结构化字段直接全 indexed**：商品有 100 个属性，全 indexed 等于 update 写放大常数 = 100。按访问模式拆 indexed/attribute/summary。
 
 ---
 
