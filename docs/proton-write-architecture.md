@@ -873,6 +873,41 @@ flowchart LR
 
 理论上可以 per-field 独立 reindex（§11.B5 详述）。但 Vespa 主线没有这个判定——保守起见全部 reindex。
 
+#### 慢路径的两种成本档位（重要区分）
+
+慢路径被触发的原因不止一种，不同触发原因对应的实际成本**差异很大**。一定要分开看：
+
+```mermaid
+flowchart TB
+    UPD[UpdateOperation] --> SCOPE[UpdateScope 分析]
+    SCOPE --> CHECK{触发原因}
+
+    CHECK -->|只动 attribute<br/>且 in-memory updateable| FAST["FAST PATH<br/>~ 微秒级<br/>无 docstore, 无 index"]
+    CHECK -->|含任一 indexed field<br/>(可能还混有其他)| SLOW_IDX["SLOW + REINDEX<br/>💥💥 N× index 写放大<br/>+ 整行 docstore R/W"]
+    CHECK -->|只含 summary-only field<br/>(非 index 非 attr)| SLOW_SUM["SLOW 但 NO REINDEX<br/>💥 整行 docstore R/W<br/>成本 ≈ O(doc size)"]
+    CHECK -->|含非-in-memory attribute<br/>(tensor replace, etc.)| SLOW_TENSOR["SLOW 特化路径<br/>看具体 attribute 类型"]
+
+    style FAST fill:#C8FFC8
+    style SLOW_SUM fill:#FFD4A0
+    style SLOW_IDX fill:#FF8080
+    style SLOW_TENSOR fill:#FFD4D4
+```
+
+**成本对比表**：
+
+| 档位 | 触发条件 | Index CPU | DocStore IO | Attribute | 主要瓶颈 |
+|---|---|---|---|---|---|
+| Fast path | 所有 touched field 都是 in-memory updateable attribute | 0 | 0 | 当前字段 | AttributeWriter 排队 |
+| Slow + reindex | 任一字段是 indexed | **N× (C)** | 整行 R+W | touched 字段 | MemoryIndex posting 插入 |
+| Slow, summary-only | 只含 summary-only（非 index 非 attr）字段 | 0 | 整行 R+W（成本 ∝ doc size） | 无 | DocStore random read + CPU serialize |
+| Slow, tensor-heavy | 含 tensor replace / HNSW 不支持 in-place | 0（除非也含 index） | 整行 R+W | 重算 tensor + graph | Attribute 重建 |
+
+**实务含义**：
+- 只有 fast path 是便宜的；其他三档都是"必须读写整行 doc"；
+- Slow + reindex 和 Slow summary-only 的**优化方向完全不同**——前者是 index 问题，后者是 docstore IO 问题；
+- 当你的 update 流混合了多种字段类型，成本是**所有 update 各自最坏路径之和**，而不是"取最差走一次"；
+- **小 summary-only 字段频繁 update 是最容易被忽视的毒点**——看起来"只不过写了 docstore 一次"，但 doc size 越大成本越大，且无法像 indexed 那样通过聚合窗口缓解得那么显著（reindex 是乘法、summary-only 是加法）。
+
 ---
 
 ## §6 Bug 解读：attribute 字段与 docstore 的纠缠
@@ -2194,15 +2229,19 @@ flowchart LR
 | 优先级 | 优化 | 实施位置 | 预期收益 |
 |---|---|---|---|
 | ★★★★★ | Schema 拆分：热写字段 attr-only | Schema 配置 | update 80%+ 走 fast path |
+| ★★★★★ | 小 summary-only 字段移到 attribute + source 重定向（§12.7 A 档） | Schema 配置 | 相应 update 转 fast path |
 | ★★★★★ | Two-phase remove + bloom（已实现） | Distributor + Proton SPI | remove 工作量 ↓80%+ |
 | ★★★★ | Catch-up 离线折叠 | 上游 pipeline | catch-up 时间 ↓80%+ |
 | ★★★★ | visibilityDelay 分级 + group commit | 配置 | 写吞吐 ↑2–5× |
+| ★★★★ | 标题类双字段拆分 search/display（§12.7 C 档） | Schema + 业务 | indexed 实时 update ↓90%+ |
+| ★★★★ | 大文本 indexed 字段延到 rebuild 批处理（§12.7 D 档） | 上游 queue | 完全消除最贵档 |
 | ★★★ | Update 聚合窗口 (§11.A11) | FeedHandler 入口 | 热点 SKU 写量 ↓80%+ |
 | ★★★ | Mem-first docstore (§11.B4) | DocStore 层 | 写 IOPS ↓N× |
+| ★★★ | Cross-doctype split（§12.7 B.2） | Schema + 查询层 | 大文本更新解耦，每 doctype 独立调优 |
 | ★★ | 独立字段 reindex (§11.B5) | Schema 编译期 + IndexMaintainer | index 写放大 ↓ |
 | ★★ | Mem-only docstore (§12.4) | DocStore + Flush | 写 IO 完全消除 |
 | ★ | Delta overlay (§11.B6) | MemoryIndex + Search | 长期演进方向 |
-| ★ | Docstore as cache | 架构级 | 极致省 IO，失去 Vespa visit |
+| ★ | Docstore as cache（§12.7 B.3） | 架构级 | 极致省 IO，失去 Vespa visit |
 
 ### §12.6 一些常见反模式
 
@@ -2211,7 +2250,171 @@ flowchart LR
 3. **catch-up 时不区分 op，全量重放**：用了 update 就吃 N× 放大。先折叠再回放；
 4. **rebuild 时保持 visibilityDelay=0**：每次 commit 都 fork-join 5 个 executor，吞吐上不去。Build 期间设 infinity；
 5. **rebuild 完直接切流，不等 catch-up 完**：业务收到的 doc 状态比 prev rebuild 旧。先确保 catch-up 追上再切；
-6. **结构化字段直接全 indexed**：商品有 100 个属性，全 indexed 等于 update 写放大常数 = 100。按访问模式拆 indexed/attribute/summary。
+6. **结构化字段直接全 indexed**：商品有 100 个属性，全 indexed 等于 update 写放大常数 = 100。按访问模式拆 indexed/attribute/summary；
+7. **小 summary-only 字段高频 update**：看似"只写一次 docstore"，实际每次都要读+反序列化+重序列化+写回整行 doc。改成 attribute + `summary { source: attr_name }`——短字段 attribute 内存几乎零；
+8. **大文本 indexed field 在实时流被 update**（最贵组合）：reindex 要对该字段完整 tokenize 一遍，加上跨字段约束 N× 放大。把"可搜索标题"和"展示标题"拆成两个字段，实时流只更新后者；
+9. **rebuild 完成后忘记关闭 bulk-mode 配置**：把 flush-maxsize 4GB、maintainer paused 等 build 期设置带进 steady-state，会在某个时间点突然卡住（memory index 撑爆 / maintainer 积压）。切流时必须显式切回 steady 配置；
+10. **TLS group commit 在 steady 期调得太大**：build 期加大是对的，steady 期会让 durability 窗口过大、ack 延迟变高。
+
+### §12.7 处理 indexed + summary-only 混合 update 流
+
+**前提场景**：实时 update 流里既有 indexed 字段（比如可搜索的标题、关键词、标签），也有 summary-only 字段（比如详情页的大文本、spec JSON、seller 描述）。没有哪一类能通过"全转 attribute"轻松消除。
+
+按字段分成 4 档处理：
+
+#### A 档：小 summary-only 字段（几十–几百字节）
+
+例如：库存状态文案、促销短语、更新时间戳、运营标记、状态标签。
+
+**最优解**：**移到 attribute**，summary class 里写 `summary { source: attr_name }`。即使从不被 rank/filter，attribute 也是合法存储：
+- Update 变成 fast path（不走慢路径、不读 docstore、不 reindex）；
+- 短字段 attribute 内存开销可忽略；
+- Summary 渲染从 attribute 取，正确。
+
+**注意事项**：如果是 string 且唯一值很多，enum store 可能膨胀。解决：`attribute: fast-search` 关掉 enum；或接受 enum 开销（每 1M 文档几十 MB 内存）。
+
+#### B 档：大文本 summary-only 字段（几 KB–几十 KB）
+
+例如：商品详情 HTML、spec JSON、seller 描述、服务条款、尺码表、长图文。
+
+**不能简单移到 attribute**——attribute 内存代价太大（几 GB 到几十 GB 级）。此时的策略：
+
+##### B.1 Mem-first docstore（中等改造）
+
+见 §11.B4 + §12.4。最近 N 分钟的 doc body 内存驻留，update 命中内存避免磁盘 random read。配合聚合窗口合并邻近 update。**对大文本 summary-only 高频 update 最具杠杆的优化**。
+
+##### B.2 Cross-doctype split（架构级，推荐认真考虑）
+
+把 schema 拆成两个 doctype，按字段更新频率分离：
+
+```mermaid
+flowchart LR
+    subgraph CORE["product_search doctype (轻 + 高频写)"]
+        direction TB
+        F1[docid]
+        F2[title: index + attr]
+        F3[price: attr]
+        F4[tags: attr weighted-set]
+        F5[category: attr]
+        F6[score signals: attr]
+    end
+
+    subgraph DETAIL["product_detail doctype (重 + 低频写)"]
+        direction TB
+        D1[docid 同上]
+        D2[description_html: summary-only 大文本]
+        D3[spec_json: summary-only]
+        D4[seller_note: summary-only]
+        D5[long_images_meta: summary-only]
+    end
+
+    Q[Query] --> CORE
+    CORE -->|top-K docid| LOOKUP["按 docid lookup"]
+    LOOKUP --> DETAIL
+    DETAIL --> RESULT[最终渲染]
+
+    style CORE fill:#C8FFC8
+    style DETAIL fill:#FFD4A0
+```
+
+**核心洞察**：写入量 × 单 doc 成本 是乘积。Split 把"高频 × 大 doc"解耦成"高频 × 小 doc" + "低频 × 大 doc"：
+
+| 维度 | 不拆分 | 拆分 |
+|---|---|---|
+| product_search 单 doc 大小 | 20 KB | 1 KB |
+| product_search 实时 update QPS | 10k | 10k |
+| product_search 单次 update 反序列化成本 | 高 | 很低 |
+| product_detail 实时 update QPS | - | 10（只在真正编辑时） |
+| product_detail 单 doc 大小 | - | 19 KB |
+| 两 doctype 可独立调 rebuild / visibilityDelay / flush | ❌ | ✅ |
+
+**代价**：
+- 查询要两段：Vespa 内用 imported field / reference field 做 join，或 client 端自己 join；
+- 两 doctype 的副本数、bucket 分布应对齐（保证 join 局部性）；
+- 运维复杂度 +1（两组 rebuild 节奏、两套监控）；
+- **一致性语义需要业务方明确**：split 后两 doctype 可能短暂不一致（一侧已更新，另一侧还没）。
+
+##### B.3 完全 externalize（最激进）
+
+大文本根本不进 Vespa，存在业务自己的 KV（TiKV / Redis / S3 / 商品中心）。Vespa 只存 docid → KV 指针。
+
+适用条件：
+- 详情页渲染本来就走 client fanout（Vespa 返 top-K docid + 轻量 summary，client 再去 KV 捞详情）；
+- 详情文本不参与任何 ranking；
+- 有成熟的商品中心 KV，不想让 Vespa 变成第二数据副本。
+
+Vespa 退化成"index + attribute 引擎"。写入路径里彻底没有大文本的 docstore IO。
+
+#### C 档：indexed field（可能 + summary）更新
+
+例如：商品标题、可搜索的品牌名、可搜索的标签集、可搜索描述关键字。
+
+**无法消除 N× 写放大**——只能降低频率 + 压缩单次成本：
+
+1. **Update 聚合窗口（§11.A11）** 对这类收益最大。同 lid 多次 title 编辑折叠成 1 次 → 频率 ÷ N；
+2. **独立字段 reindex（§11.B5）** 如果该字段不参与跨字段 phrase / fieldset，编译期判定 independent → 单字段 reindex；
+3. **业务侧去抖**：比如标题编辑 5 秒内的连续改动合并成一次发给 Vespa（类似 IDE 保存去抖）；
+4. **Schema 双写技巧**：把"可搜索标题"和"展示标题"拆成两个字段：
+   ```
+   field title_search type string { indexing: index }   # 稳定，只在 rebuild 更新
+   field title_display type string { indexing: attribute | summary }  # 频繁更新
+   ```
+   查询 match 走 `title_search`，渲染用 `title_display`。大部分电商业务方实际是"展示要实时、搜索可延迟"——这个拆分正好利用。延迟代价：新标题的搜索效果要等次日 rebuild 生效。
+
+#### D 档：indexed 且大文本字段（最贵）
+
+例如：`index: description` 几 KB 长文，实时被 update。
+
+**强烈建议**：**不接受实时更新**。实现方式：
+- 业务方发来 description 编辑 → 不落 Vespa，写入单独 queue；
+- 累积到次日 rebuild 时统一消费（rebuild 直接从 source 拉最新 description）；
+- 代价：description 内容搜索延迟 24 小时生效，但**描述的搜索权重本来就不高**，大部分业务可以接受。
+
+如果业务必须实时：只能用 §12.7.B.2 cross-doctype split，把 description 隔离到一个独立 doctype，用它自己的 rebuild 节奏（比如每小时 rebuild 一次）。
+
+#### 按字段优化的决策矩阵
+
+```mermaid
+flowchart TB
+    F[某字段 F 出现在 update 流] --> Q1{F 在 summary class 中?}
+    Q1 -->|否| Q2{F 是 indexed?}
+    Q1 -->|是| Q3{F 是 indexed?}
+
+    Q2 -->|是 (C 档)| OPTC[聚合窗口 + 独立 reindex<br/>+ 业务去抖 + 双字段拆分]
+    Q2 -->|否 (纯 attribute)| FAST[已是 fast path]
+
+    Q3 -->|是| Q4{F 是大文本?}
+    Q3 -->|否| Q5{F 是大文本?}
+
+    Q4 -->|是 (D 档 最贵)| DEFER[延到 rebuild 批处理<br/>或 cross-doctype split]
+    Q4 -->|否 (indexed + small)| OPTC2[同 C 档]
+
+    Q5 -->|否 (A 档 小 summary-only)| MOVE[移到 attribute<br/>summary source 重定向]
+    Q5 -->|是 (B 档 大 summary-only)| OPTB[mem-first / split / externalize]
+
+    style FAST fill:#C8FFC8
+    style DEFER fill:#FF8080
+    style MOVE fill:#C8FFC8
+    style OPTC fill:#FFD4D4
+    style OPTC2 fill:#FFD4D4
+    style OPTB fill:#FFD4A0
+```
+
+#### 你们场景的典型处方
+
+假设一个电商 product schema 有 50 个字段，实时 update 流触及其中 15 个：
+
+| 字段类 | 数量 | 处理 |
+|---|---|---|
+| 价格、库存、CTR、ranking 信号 | 4 | 保持 attr-only，fast path |
+| 标题（indexed） | 1 | 双字段拆分（search/display） |
+| 品牌名、类目（indexed）| 2 | 聚合窗口 + 独立 reindex |
+| 小文案（促销标签、状态）| 3 | 移到 attribute，summary source 重定向 |
+| Spec JSON、描述 HTML（大 summary-only） | 2 | Cross-doctype split 到 product_detail |
+| 图片 meta、seller 描述（大 summary-only） | 2 | 同上（进 product_detail）|
+| 标签 weighted-set | 1 | attr-only weighted-set，fast path |
+
+处理后：**~10 个字段走 fast path，3 个走 C 档（配聚合窗口缓解），2 个独立 doctype（低频）**，真正命中 §5.5 N× 写放大路径的 update 占比可以从 70% 降到 <10%。
 
 ---
 
