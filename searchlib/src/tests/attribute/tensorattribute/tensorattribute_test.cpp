@@ -127,6 +127,7 @@ private:
     generation_t _trim_gen;
     mutable size_t _memory_usage_cnt;
     int _index_value;
+    mutable uint32_t _last_explore_k;
 
 public:
     MockNearestNeighborIndex(const DocVectorAccess& vectors)
@@ -138,9 +139,11 @@ public:
           _transfer_gen(std::numeric_limits<generation_t>::max()),
           _trim_gen(std::numeric_limits<generation_t>::max()),
           _memory_usage_cnt(0),
-          _index_value(0)
+          _index_value(0),
+          _last_explore_k(0)
     {
     }
+    uint32_t last_explore_k() const { return _last_explore_k; }
     void clear() {
         _adds.clear();
         _removes.clear();
@@ -247,8 +250,8 @@ public:
     {
         (void) k;
         (void) vector;
-        (void) explore_k;
         (void) distance_threshold;
+        _last_explore_k = explore_k;
         return std::vector<Neighbor>();
     }
     std::vector<Neighbor> find_top_k_with_filter(uint32_t k, vespalib::eval::TypedCells vector,
@@ -257,9 +260,9 @@ public:
     {
         (void) k;
         (void) vector;
-        (void) explore_k;
         (void) filter;
         (void) distance_threshold;
+        _last_explore_k = explore_k;
         return std::vector<Neighbor>();
     }
 
@@ -1121,6 +1124,66 @@ TEST_F("NN blueprint do NOT want global filter when NOT having index (implicit b
 {
     auto bp = f.make_blueprint();
     EXPECT_FALSE(bp->getState().want_global_filter());
+}
+
+// Track A: adaptive explore_k based on global-filter selectivity.
+// The fixture populates 11 docs (1..10 + reserved doc 0), k=3, base_extra=5.
+// So (k + base_extra) == 8 is the baseline ef_search.
+
+TEST_F("NN blueprint keeps baseline explore_k when there is no filter", NearestNeighborBlueprintFixture)
+{
+    auto bp = f.make_blueprint();
+    auto empty_filter = GlobalFilter::create();
+    bp->set_global_filter(*empty_filter);
+    // No filter -> unchanged: k + base_extra = 3 + 5 = 8
+    EXPECT_EQUAL(8u, f.mock_index().last_explore_k());
+}
+
+TEST_F("NN blueprint scales explore_k by 1/selectivity for a weak filter", NearestNeighborBlueprintFixture)
+{
+    auto bp = f.make_blueprint();
+    auto filter = search::BitVector::create(11);
+    filter->setBit(1);
+    filter->setBit(3);
+    filter->setBit(5);
+    filter->setBit(7);
+    filter->setBit(9);
+    filter->setBit(10);
+    filter->invalidateCachedCount();
+    auto weak_filter = GlobalFilter::create(std::move(filter));
+    bp->set_global_filter(*weak_filter);
+    // selectivity = 6/11 = 0.5454..., factor = 1/0.5454 = 1.8333...
+    // target_ef = 8 * 1.8333 = 14.6666 -> 14 (trunc), extras = 14 - 3 = 11
+    // explore_k = k + extras = 3 + 11 = 14
+    EXPECT_EQUAL(14u, f.mock_index().last_explore_k());
+}
+
+TEST_F("NN blueprint caps explore_k multiplier for a strong filter", NearestNeighborBlueprintFixture)
+{
+    auto bp = f.make_blueprint();
+    // Only bit 3 set -> 1/11 ~= 0.09, above brute_force_limit=0.05, approximate still runs.
+    auto filter = search::BitVector::create(11);
+    filter->setBit(3);
+    filter->invalidateCachedCount();
+    auto strong_filter = GlobalFilter::create(std::move(filter));
+    bp->set_global_filter(*strong_filter);
+    // 1/0.0909 = 11, capped to mult_cap=4. target_ef = 8 * 4 = 32, extras = 29
+    // explore_k = 3 + 29 = 32
+    EXPECT_EQUAL(32u, f.mock_index().last_explore_k());
+}
+
+TEST_F("NN blueprint treats full filter as neutral selectivity", NearestNeighborBlueprintFixture)
+{
+    auto bp = f.make_blueprint();
+    auto filter = search::BitVector::create(11);
+    for (uint32_t i = 0; i < 11; ++i) {
+        filter->setBit(i);
+    }
+    filter->invalidateCachedCount();
+    auto full_filter = GlobalFilter::create(std::move(filter));
+    bp->set_global_filter(*full_filter);
+    // selectivity = 11/11 = 1.0 -> adaptive_extra == base_extra -> explore_k == 8
+    EXPECT_EQUAL(8u, f.mock_index().last_explore_k());
 }
 
 TEST("Dense tensor attribute with paged flag uses mmap file allocator")

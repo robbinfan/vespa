@@ -31,6 +31,7 @@ private:
     mutable NearestNeighborDistanceHeap _distance_heap;
     std::vector<search::tensor::NearestNeighborIndex::Neighbor> _found_hits;
     std::shared_ptr<const GlobalFilter> _global_filter;
+    double _global_filter_hit_ratio;
 
     void perform_top_k();
 public:

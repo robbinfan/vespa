@@ -22,6 +22,35 @@ namespace search::queryeval {
 
 namespace {
 
+// Track A: adaptive explore_k based on global-filter selectivity.
+// When a global filter culls most of the beam, a fixed ef_search shrinks the
+// *effective* beam and recall drops. Scale extras by 1/selectivity (bounded),
+// never going below the user-/autotune-supplied baseline.
+// Compile-time kill-switch for fast rollback.
+constexpr bool     kEnableAdaptiveExplore = true;
+constexpr double   kAdaptiveMultCap       = 4.0;   // at most 4x the baseline ef
+constexpr uint32_t kAdaptiveAbsCap        = 2000;  // hard ceiling on extras
+
+uint32_t
+compute_adaptive_explore(uint32_t k, uint32_t base_extra, double selectivity) noexcept
+{
+    if (!kEnableAdaptiveExplore || selectivity >= 1.0 || selectivity <= 0.0) {
+        return base_extra;
+    }
+    double factor = std::min(kAdaptiveMultCap, 1.0 / selectivity);
+    double target_ef = static_cast<double>(k + base_extra) * factor;
+    uint64_t target_extra = (target_ef > static_cast<double>(k))
+        ? static_cast<uint64_t>(target_ef - static_cast<double>(k))
+        : 0;
+    if (target_extra < base_extra) {
+        target_extra = base_extra;
+    }
+    if (target_extra > kAdaptiveAbsCap) {
+        target_extra = kAdaptiveAbsCap;
+    }
+    return static_cast<uint32_t>(target_extra);
+}
+
 template<typename LCT, typename RCT>
 std::unique_ptr<Value>
 convert_cells(const ValueType &new_type, std::unique_ptr<Value> old_value)
@@ -69,7 +98,8 @@ NearestNeighborBlueprint::NearestNeighborBlueprint(const queryeval::FieldSpec& f
       _fallback_dist_fun(),
       _distance_heap(target_num_hits),
       _found_hits(),
-      _global_filter(GlobalFilter::create())
+      _global_filter(GlobalFilter::create()),
+      _global_filter_hit_ratio(1.0)
 {
     CellType attr_ct = _attr_tensor.getTensorType().cell_type();
     _fallback_dist_fun = search::tensor::make_distance_function(_attr_tensor.distance_metric(), attr_ct);
@@ -111,13 +141,18 @@ NearestNeighborBlueprint::set_global_filter(const GlobalFilter &global_filter)
         if (_global_filter->has_filter()) {
             uint32_t max_hits = _global_filter->filter()->countTrueBits();
             LOG(debug, "set_global_filter getNumDocs: %u / max_hits %u", est_hits, max_hits);
-            double max_hit_ratio = static_cast<double>(max_hits) / est_hits;
+            double max_hit_ratio = (est_hits > 0)
+                ? static_cast<double>(max_hits) / est_hits
+                : 1.0;
+            _global_filter_hit_ratio = max_hit_ratio;
             if (max_hit_ratio < _brute_force_limit) {
                 _approximate = false;
                 LOG(debug, "too many hits filtered out, using brute force implementation");
             } else {
                 est_hits = std::min(est_hits, max_hits);
             }
+        } else {
+            _global_filter_hit_ratio = 1.0;
         }
         if (_approximate) {
             est_hits = std::min(est_hits, _target_num_hits);
@@ -137,7 +172,10 @@ NearestNeighborBlueprint::perform_top_k()
         uint32_t k = _target_num_hits;
         if (_global_filter->has_filter()) {
             auto filter = _global_filter->filter();
-            _found_hits = nns_index->find_top_k_with_filter(k, lhs, *filter, k + _explore_additional_hits, _distance_threshold);
+            uint32_t adaptive_extra = compute_adaptive_explore(k, _explore_additional_hits, _global_filter_hit_ratio);
+            LOG(debug, "adaptive explore: k=%u base_extra=%u adaptive_extra=%u selectivity=%.4f",
+                k, _explore_additional_hits, adaptive_extra, _global_filter_hit_ratio);
+            _found_hits = nns_index->find_top_k_with_filter(k, lhs, *filter, k + adaptive_extra, _distance_threshold);
         } else {
             _found_hits = nns_index->find_top_k(k, lhs, k + _explore_additional_hits, _distance_threshold);
         }
